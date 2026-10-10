@@ -819,6 +819,54 @@ test('graphql face: POST executes with caller credentials, GET answers 405 usage
   assert.ok((await html.text()).includes('GraphiQL'))
 })
 
+test('graphql face: variables travel to execution (not just operationName)', async () => {
+  const fresh = await createApp()
+  const res = await fresh.app.request('/graphql', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...AUTH },
+    body: JSON.stringify({
+      query: 'query Q($id: String!) { notes { get_note(id: $id) { title } } }',
+      variables: { id: 'n1' },
+    }),
+  })
+  // The regression: variables was dropped (hardcoded undefined), so every
+  // parameterized document failed variable coercion with a 400.
+  assert.equal(res.status, 200)
+  const body = (await res.json()) as { data?: { notes?: { get_note?: { title?: string } } } }
+  assert.equal(body.data?.notes?.get_note?.title, 'Buy milk')
+
+  // A malformed variables value is its own 400, distinct from variable coercion.
+  const bad = await fresh.app.request('/graphql', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...AUTH },
+    body: JSON.stringify({ query: '{ notes { list_notes { id } } }', variables: 'oops' }),
+  })
+  assert.equal(bad.status, 400)
+  assert.ok(((await bad.json()) as { errors: Array<{ message: string }> }).errors[0].message.includes('variables'))
+})
+
+test('graphql face: non-JSON content-type is refused with 415 (cross-site form POST cannot reach the executor)', async () => {
+  const fresh = await createApp()
+  // Hono's c.req.json() would happily JSON.parse a text/plain body; without
+  // the check this is a CORS "simple request" — no preflight — that a
+  // cross-site HTML form can fire with the caller's session cookie riding
+  // `cookie` passthrough. 415 closes the path.
+  const res = await fresh.app.request('/graphql', {
+    method: 'POST',
+    headers: { 'content-type': 'text/plain', origin: 'https://evil.example' },
+    body: JSON.stringify({ query: '{ notes { list_notes { id } } }' }),
+  })
+  assert.equal(res.status, 415)
+
+  // charset parameters stay legal — the media type is what matters.
+  const charset = await fresh.app.request('/graphql', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json; charset=utf-8', ...AUTH },
+    body: JSON.stringify({ query: '{ notes { list_notes { id } } }' }),
+  })
+  assert.equal(charset.status, 200)
+})
+
 test('graphiql: pinned importmap, single shared React, fetcher wired to the endpoint', async () => {
   const fresh = await createApp()
   const html = await (await fresh.app.request('/graphiql')).text()
@@ -1069,6 +1117,21 @@ test('auth gate: verifyToken returning null refuses with 401', async () => {
   assert.ok(res.headers.get('www-authenticate')?.includes('invalid_token'))
 })
 
+test('auth gate: sharedSecret — exact token passes, near-misses refuse (constant-time compare)', async () => {
+  const fresh = await createApp()
+  const gated = new HonoGqlMcp(fresh.app, { name: 'secret-gate', auth: { sharedSecret: 's3cret-token-abcdef' } })
+  gated.mountTo(fresh.app, '/mcp-secret')
+  // Prefix, suffix, longer, shorter: every near-miss must refuse. (The
+  // comparison is constant-time — a timing signal cannot be asserted in a
+  // test, but these pin the equality semantics it must preserve.)
+  for (const token of ['s3cret-token-abcde', 's3cret-token-abcdef0', 'x3cret-token-abcdef', '']) {
+    const res = await postTo(fresh.app, '/mcp-secret', ...(token ? [{ authorization: `Bearer ${token}` }] : []))
+    assert.equal(res.status, 401, `near-miss '${token}' must refuse`)
+  }
+  const ok = await postTo(fresh.app, '/mcp-secret', { authorization: 'Bearer s3cret-token-abcdef' })
+  assert.equal(ok.status, 200)
+})
+
 test('auth gate: requiredScopes — missing scope → 403 with a scope hint', async () => {
   const fresh = await createApp()
   const authInfo = (scopes: string[]) => ({ token: 't', clientId: 'c', scopes, expiresAt: Math.floor(Date.now() / 1000) + 3600 })
@@ -1216,6 +1279,82 @@ test('auth: config errors — verifier sources are mutually exclusive and requir
         auth: { verifyToken: () => null, sharedSecret: 'x' },
       }),
     (e: unknown) => e instanceof Error && /only one/.test(e.message),
+  )
+})
+
+// -- host/origin validation on /mcp ----------------------------------------------
+
+test('host validation: default is localhost-only — a real hostname is 403 until allowed', async () => {
+  const fresh = await createApp()
+  // Mount every bridge BEFORE the first request — Hono builds its route
+  // matcher on first request and rejects later registrations.
+  const gated = new HonoGqlMcp(fresh.app, {
+    name: 'domain',
+    hostValidation: { allowedHostnames: ['api.example.com'], allowedOrigins: ['claude.ai'] },
+  })
+  gated.mountTo(fresh.app, '/mcp-domain')
+  const open = new HonoGqlMcp(fresh.app, { name: 'open-host', hostValidation: { allowedHostnames: [] } })
+  open.mountTo(fresh.app, '/mcp-anyhost')
+
+  const init = (host: string, origin: string | undefined, authorization?: string) =>
+    fresh.app.request(
+      new Request('http://localhost:8100/mcp', {
+        method: 'POST',
+        headers: {
+          ...JSONRPC_HEADERS,
+          host,
+          ...(origin ? { origin } : {}),
+          ...(authorization ? { authorization } : {}),
+        },
+        body: INIT_BODY,
+      }),
+    )
+  // Default (no hostValidation): any non-localhost Host is refused — CLI MCP
+  // clients send Host, so a domain deployment is dead until it opts in.
+  assert.equal((await init('api.example.com', undefined)).status, 403)
+  // localhost passes the host check (the auth gate then answers 200 with a
+  // real token — host validation runs BEFORE the gate, so the 403s above
+  // fired without one).
+  assert.equal((await init('localhost:8100', undefined, AUTH.authorization)).status, 200)
+  // Browsers send Origin too; same allowlist applies.
+  assert.equal((await init('localhost:8100', 'https://claude.ai')).status, 403)
+
+  // Opt-in: naming the hostname lets its CLI and browser clients through.
+  const initOn = (path: string, host: string, origin?: string, authorization?: string) =>
+    fresh.app.request(
+      new Request(`http://localhost:8100${path}`, {
+        method: 'POST',
+        headers: { ...JSONRPC_HEADERS, host, ...(origin ? { origin } : {}), ...(authorization ? { authorization } : {}) },
+        body: INIT_BODY,
+      }),
+    )
+  assert.equal((await initOn('/mcp-domain', 'api.example.com', undefined, AUTH.authorization)).status, 200, 'CLI client: Host allowed')
+  assert.equal(
+    (await initOn('/mcp-domain', 'api.example.com', 'https://claude.ai', AUTH.authorization)).status, 200,
+    'browser client: Origin allowed',
+  )
+  assert.equal((await initOn('/mcp-domain', 'localhost:8100')).status, 403, 'not in the allowlist anymore')
+  // Empty arrays disable each half — an explicit escape hatch for hosts that
+  // terminate TLS upstream and cannot vouch for Host/Origin at all.
+  const anyHost = await fresh.app.request(
+    new Request('http://localhost:8100/mcp-anyhost', {
+      method: 'POST',
+      headers: { ...JSONRPC_HEADERS, host: 'whatever.example' },
+      body: INIT_BODY,
+    }),
+  )
+  assert.equal(anyHost.status, 200)
+})
+
+test('host validation: a malformed allowlist fails at construction', async () => {
+  const { app } = await createApp()
+  assert.throws(
+    () => new HonoGqlMcp(app, { hostValidation: { allowedHostnames: ['ok', ''] } }),
+    (e: unknown) => e instanceof Error && e.name === 'HonoGqlMcpConfigError',
+  )
+  assert.throws(
+    () => new HonoGqlMcp(app, { hostValidation: { allowedOrigins: 'claude.ai' as never } }),
+    (e: unknown) => e instanceof Error && e.name === 'HonoGqlMcpConfigError',
   )
 })
 

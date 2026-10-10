@@ -142,6 +142,17 @@ export function mountGraphQL(
   const graphiqlPath = opts.graphiqlPath ?? '/graphiql'
 
   app.post(graphqlPath, async (c) => {
+    // application/json only. Hono's c.req.json() JSON.parses any content-type,
+    // so without this check a text/plain HTML-form POST is a CORS "simple
+    // request" — no preflight — and a cross-site page could fire mutations
+    // with the caller's session cookie (when `cookie` is whitelisted).
+    const contentType = c.req.header('content-type')?.split(';', 1)[0]?.trim().toLowerCase()
+    if (contentType !== 'application/json') {
+      return c.json(
+        { errors: [{ message: `Content-Type must be application/json (got '${contentType || 'none'}').` }] },
+        415,
+      )
+    }
     let body: { query?: unknown; variables?: unknown; operationName?: unknown }
     try {
       body = await c.req.json()
@@ -151,7 +162,11 @@ export function mountGraphQL(
     if (typeof body.query !== 'string') {
       return c.json({ errors: [{ message: "Body must carry a string 'query'." }] }, 400)
     }
-    const result = await handler.execute(body.query, undefined, {
+    // variables: a plain object of variable values, when the document declares any.
+    if (body.variables !== undefined && (typeof body.variables !== 'object' || body.variables === null || Array.isArray(body.variables))) {
+      return c.json({ errors: [{ message: "'variables' must be an object of variable values." }] }, 400)
+    }
+    const result = await handler.execute(body.query, body.variables as Record<string, unknown> | undefined, {
       // The executor applies the passthrough whitelist — raw headers are safe
       // to hand over; only whitelisted names ever reach a route.
       headers: c.req.raw.headers,

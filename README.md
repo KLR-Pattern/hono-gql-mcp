@@ -193,7 +193,11 @@ per use case, each scoped by its own filters, each mounted at its own path.
 handler's passthrough whitelist with MCP — browser sessions ride `cookie`
 once it is whitelisted. Status parity with the Python face: 200 while `data`
 is present (partial failure keeps nulls + errors), 400 for whole-document
-failure.
+failure. The POST must carry `Content-Type: application/json` (415 otherwise)
+— Hono's body parser accepts any content-type, and a `text/plain` HTML-form
+POST is a CORS "simple request" that skips preflight, so the check is what
+keeps a cross-site page from firing mutations with a whitelisted session
+cookie.
 
 ## Options
 
@@ -217,6 +221,10 @@ new HonoGqlMcp(app, {
   documentCacheSize: 128,
   maxResponseChars: 1_000_000,        // tool result truncation bound
   rateLimit: { maxPerSecond: 10 },    // optional, per-process, keyed by hashed authorization
+  hostValidation: {                   // REQUIRED when deployed on a real hostname —
+    allowedHostnames: ['api.example.com'],  // the default (localhost-only) 403s every
+    allowedOrigins: ['claude.ai'],          // other Host/Origin; [] disables either half
+  },
   auth: { … },                        // gate the MCP endpoint — see Authentication
 })
 ```
@@ -257,6 +265,25 @@ Plus two MCP-face guards: `maxResponseChars` (default 1M) truncates oversized
 tool results with a marker, and the optional `rateLimit` is a per-process
 fixed-window limiter keyed by a hash of the caller's authorization header
 (credentials are never stored) — `keyBy` customizes the key.
+
+**`hostValidation` — read this before deploying past localhost.** The MCP
+endpoint validates the `Host` and `Origin` headers (DNS-rebinding and
+cross-site protection, on the SDK's validators), and the default allowlist is
+`localhost / 127.0.0.1 / [::1]` only. On a real hostname **every request is
+answered 403** — CLI MCP clients send `Host`, browsers send both — until you
+name the host:
+
+```ts
+new HonoGqlMcp(app, {
+  hostValidation: {
+    allowedHostnames: ['api.example.com'], // port-agnostic hostnames; IPv6 needs brackets
+    allowedOrigins: ['claude.ai'],         // browser clients; non-browser clients send no Origin and always pass
+  },
+})
+```
+
+Each half defaults independently to the localhost allowlist; pass `[]` to
+disable one (e.g. behind a TLS-terminating proxy that rewrites Host).
 
 `readiness()` returns the CI-assertable audit — `{ ready, skips, degraded,
 degradedFields, renames }` — the same classifier the startup notices come from,

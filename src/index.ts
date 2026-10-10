@@ -22,7 +22,7 @@ import { Hono, type Hono as HonoType } from 'hono'
 import type { McpHttpHandler } from '@modelcontextprotocol/server'
 import type { OpenAPIHono } from '@hono/zod-openapi'
 import { RouterGraphQLHandler } from './handler.ts'
-import { buildMcpHandler, mountMcp, PROGRESSIVE_THRESHOLD, type RateLimitOptions, type ResolvedMode, type ToolMode } from './mcp.ts'
+import { buildMcpHandler, mountMcp, PROGRESSIVE_THRESHOLD, type HostValidationOptions, type RateLimitOptions, type ResolvedMode, type ToolMode } from './mcp.ts'
 import { mountGraphQL, type GraphqlMountOptions } from './http-api.ts'
 import { resolveAuth, type AuthDiscoveryOptions, type AuthOptions, type ResolvedAuth } from './auth.ts'
 import { HonoGqlMcpConfigError } from './errors.ts'
@@ -74,6 +74,13 @@ export interface BridgeOptions extends ScanFilters {
    */
   rateLimit?: RateLimitOptions
   /**
+   * Host/Origin validation on the MCP endpoint (DNS-rebinding and cross-site
+   * protection). Default: the localhost allowlists — safe for local
+   * development, but a server on a real hostname MUST pass it here, or every
+   * request is answered 403. Each half accepts `[]` to disable it.
+   */
+  hostValidation?: HostValidationOptions
+  /**
    * Gate the MCP endpoint: Bearer verification (401), endpoint-level and
    * per-tool scopes (403), optional RFC 9728 discovery documents.
    * See AuthOptions — one token, two checks: the gate verifies the endpoint,
@@ -94,6 +101,7 @@ export class HonoGqlMcp {
   readonly #mode: ResolvedMode
   readonly #maxResponseChars: number
   readonly #rateLimit: RateLimitOptions | undefined
+  readonly #hostValidation: HostValidationOptions
   readonly #auth: ResolvedAuth | undefined
   #httpHandler?: McpHttpHandler
 
@@ -115,6 +123,15 @@ export class HonoGqlMcp {
     }
     // Resolve auth before anything else is derived — bad combinations fail fast.
     const auth = opts.auth ? resolveAuth(opts.auth) : undefined
+    const hostValidation = opts.hostValidation ?? {}
+    for (const [key, list] of [
+      ['allowedHostnames', hostValidation.allowedHostnames],
+      ['allowedOrigins', hostValidation.allowedOrigins],
+    ] as const) {
+      if (list !== undefined && (!Array.isArray(list) || list.some((h) => typeof h !== 'string' || h.length === 0))) {
+        throw new HonoGqlMcpConfigError(`hostValidation.${key} must be an array of non-empty hostname strings`)
+      }
+    }
 
     this.#name = opts.name ?? 'hono-app'
     this.#version = opts.version ?? '0.1.0'
@@ -137,6 +154,7 @@ export class HonoGqlMcp {
     this.resolvedMode = this.#mode
     this.#maxResponseChars = maxResponseChars
     this.#rateLimit = opts.rateLimit
+    this.#hostValidation = hostValidation
     this.#auth = auth
     this.#instructions =
       opts.instructions ??
@@ -205,7 +223,7 @@ export class HonoGqlMcp {
       maxResponseChars: this.#maxResponseChars,
       ...(this.#auth?.toolScopes ? { toolScopes: this.#auth.toolScopes } : {}),
     })
-    mountMcp(app, this.#httpHandler, path, this.#rateLimit, this.#auth)
+    mountMcp(app, this.#httpHandler, path, this.#rateLimit, this.#auth, this.#hostValidation)
   }
 
   /** Mount the plain-GraphQL HTTP face: POST /graphql + GET /graphiql (shares the passthrough whitelist). */
@@ -245,5 +263,5 @@ export type { BridgeValidatorOptions, ValidatorTarget, ValidatorAttachment } fro
 export type { AuthOptions, AuthDiscoveryOptions, ResolvedAuth } from './auth.ts'
 export type { SkipRecord, DegradedRecord } from './schema-builder.ts'
 export type { ReadinessReport } from './handler.ts'
-export type { ToolMode, ResolvedMode, RateLimitOptions } from './mcp.ts'
+export type { ToolMode, ResolvedMode, RateLimitOptions, HostValidationOptions } from './mcp.ts'
 export type { AuthInfo } from '@modelcontextprotocol/server'

@@ -496,6 +496,22 @@ export interface RateLimitOptions {
   keyBy?: (request: Request) => string
 }
 
+/**
+ * Host/Origin validation for the MCP endpoint — DNS-rebinding and cross-site
+ * protection, on the SDK's validators.
+ *
+ * Defaults are the localhost allowlists (safe for local development). A
+ * server on a real hostname MUST pass it here — the default rejects every
+ * request whose Host/Origin names another domain, CLI clients included (they
+ * send Host, browsers send both). `[]` disables that half of the check.
+ */
+export interface HostValidationOptions {
+  /** Allowed Host header hostnames, port-agnostic ('api.example.com'; IPv6 needs brackets: '[::1]'). */
+  allowedHostnames?: string[]
+  /** Allowed Origin header hostnames. A missing Origin passes (non-browser clients). */
+  allowedOrigins?: string[]
+}
+
 function hashKey(s: string): string {
   let h = 5381
   for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0
@@ -544,8 +560,11 @@ export function mountMcp(
   path = '/mcp',
   rateLimit?: RateLimitOptions,
   auth?: ResolvedAuth,
+  hostValidation: HostValidationOptions = {},
 ): void {
   const limiter = rateLimit ? new FixedWindowLimiter(rateLimit.maxPerSecond) : undefined
+  const allowedHostnames = hostValidation.allowedHostnames ?? localhostAllowedHostnames()
+  const allowedOrigins = hostValidation.allowedOrigins ?? localhostAllowedOrigins()
   const serve = (c: { req: { raw: Request } }) => {
     if (limiter) {
       const key = rateLimit!.keyBy?.(c.req.raw) ?? hashKey(c.req.raw.headers.get('authorization') ?? 'anonymous')
@@ -559,8 +578,8 @@ export function mountMcp(
       }
     }
     const rejected =
-      hostHeaderValidationResponse(c.req.raw, localhostAllowedHostnames()) ??
-      originValidationResponse(c.req.raw, localhostAllowedOrigins())
+      (allowedHostnames.length > 0 ? hostHeaderValidationResponse(c.req.raw, allowedHostnames) : undefined) ??
+      (allowedOrigins.length > 0 ? originValidationResponse(c.req.raw, allowedOrigins) : undefined)
     if (rejected) return Promise.resolve(rejected)
     if (!auth) return httpHandler.fetch(c.req.raw)
     // One token, two checks: the gate verifies the ENDPOINT; the routes'
