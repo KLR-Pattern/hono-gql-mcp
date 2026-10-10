@@ -75,7 +75,16 @@ interface FrontHalf {
   errors: readonly GraphQLError[]
 }
 
-/** Max selection-set nesting of a document; fragments resolved by name, cycles guarded. Root set = depth 1. */
+/**
+ * Max selection-set nesting of a document; fragments resolved by name, cycles
+ * guarded. Root set = depth 1.
+ *
+ * Introspection meta-fields (`__`-prefixed) do not count toward depth:
+ * standard tooling (GraphiQL, codegen, IDE plugins) ships a fixed, deep
+ * introspection document — depth ~16 — whose shape is bounded by the schema
+ * itself, not by the caller. The guard targets runaway DATA selections.
+ * (Python parity: fastapi-gql-mcp's depth_guard.py skips them the same way.)
+ */
 export function documentDepth(document: DocumentNode): number {
   const fragments = new Map<string, FragmentDefinitionNode>()
   for (const def of document.definitions) {
@@ -87,6 +96,7 @@ export function documentDepth(document: DocumentNode): number {
     for (const sel of set.selections) {
       switch (sel.kind) {
         case 'Field':
+          if (sel.name.value.startsWith('__')) break // introspection: bounded by the schema, not the caller
           if (sel.selectionSet) visit(sel.selectionSet, depth + 1, seenFragments)
           break
         case 'InlineFragment':
