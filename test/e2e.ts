@@ -651,6 +651,44 @@ test('graphql face: POST executes with caller credentials, GET answers 405 usage
   assert.ok((await html.text()).includes('GraphiQL'))
 })
 
+test('graphiql: pinned importmap, single shared React, fetcher wired to the endpoint', async () => {
+  const fresh = await createApp()
+  const html = await (await fresh.app.request('/graphiql')).text()
+
+  // The importmap must be valid JSON — a malformed one fails silently in the
+  // browser, leaving the loading placeholder up forever.
+  const raw = html.match(/<script type="importmap">([\s\S]*?)<\/script>/)?.[1]
+  assert.ok(raw, 'importmap script present')
+  const { imports } = JSON.parse(raw) as { imports: Record<string, string> }
+
+  // Every entry is version-pinned. esm.sh resolves an unversioned specifier to
+  // `latest`, so an unpinned entry lets the playground change under us.
+  for (const [name, url] of Object.entries(imports)) {
+    if (url.startsWith('data:')) continue
+    assert.match(url, /(?:@\d+\.\d+\.\d+|@\d+\/)/, `importmap entry '${name}' is unpinned: ${url}`)
+  }
+  assert.match(imports['graphiql'], /^https:\/\/esm\.sh\/graphiql@/)
+  assert.match(imports['react'], /^https:\/\/esm\.sh\/react@/)
+
+  // `external=` keeps one React instance across every bundle — without it the
+  // GraphiQL hooks and the Explorer plugin each load their own copy.
+  assert.ok(imports['graphiql'].includes('external=react,react-dom,@graphiql/react,graphql'))
+  assert.ok(imports['@graphiql/plugin-explorer'].includes('external=react,@graphiql/react,graphql'))
+
+  // The page configures the fetcher for the mounted path, not a hardcoded one.
+  assert.ok(html.includes("url: \"/graphql\""), 'fetcher points at the mount path')
+  assert.ok(html.includes("credentials: 'same-origin'"), 'session cookie rides along')
+  assert.ok(html.includes('explorerPlugin'), 'Explorer plugin wired')
+  assert.ok(!html.includes('${'), 'no unsubstituted template placeholder leaked into the page')
+
+  // A custom mount path flows into the page as a JS-safe literal.
+  const custom = new OpenAPIHono()
+  const bridge = new HonoGqlMcp(custom, { name: 'custom-graphql' })
+  bridge.mountGraphQL(custom, { graphqlPath: '/api/gql', graphiqlPath: '/play' })
+  const customHtml = await (await custom.request('/play')).text()
+  assert.ok(customHtml.includes('url: "/api/gql"'), 'custom graphqlPath reaches the fetcher')
+})
+
 // -- REST docs: OpenAPI document + Swagger UI ------------------------------------------
 
 test('docs: /openapi.json derives from the same createRoute definitions, recursion ref-safe', async () => {
