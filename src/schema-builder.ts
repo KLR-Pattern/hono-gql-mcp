@@ -31,7 +31,7 @@ import {
 import type { RouteConfig } from '@asteasolutions/zod-to-openapi'
 import { GraphQLJSON, ZodGraphqlMapper } from './zod-to-graphql.ts'
 import { jsonBodySchemaOf, type RouteInfo } from './scanner.ts'
-import type { RouteExecutor } from './executor.ts'
+import type { ExecutionContext, RouteExecutor } from './executor.ts'
 import { DomainRegistry, domainsFor, type DomainEntry } from './domains.ts'
 import { fnmatchToRegExp } from './fnmatch.ts'
 import { DuplicateFieldError } from './errors.ts'
@@ -60,8 +60,10 @@ export interface BuildResult {
   schema: GraphQLSchema
   skips: SkipRecord[]
   degraded: DegradedRecord[]
-  /** Field-level raw-JSON degradations, `[where, reason]` (e.g. `['Stats.by_tag', 'zod record → JSON']`). */
+  /** Field-level raw-JSON degradations, `[where, reason]` (e.g. `['by_tag', 'zod record → JSON']`). */
   degradedFields: Array<[string, string]>
+  /** Type-name disambiguations, `[name, 'reused → name_N']`. Informational — never a readiness failure. */
+  renames: Array<[string, string]>
   /** Domain registry answering progressive-disclosure queries. */
   registry: DomainRegistry
   /** (domainPath, fieldName) → field config, for the progressive list tools. */
@@ -71,6 +73,14 @@ export interface BuildResult {
   routeCount: number
   /** Top-level domain names, for the MCP instructions line. */
   domains: string[]
+  /**
+   * False when no read route survived the scan, so `type Query` has no fields.
+   * GraphQL then considers the whole schema invalid and every execution fails,
+   * so the handler refuses documents with a clear error up front instead of
+   * letting graphql-js throw. Reachable through ordinary configuration: a
+   * write-only app, or filters that kept nothing.
+   */
+  hasQueryOperations: boolean
 }
 
 const LEGAL_GRAPHQL_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/
@@ -321,8 +331,10 @@ export function buildSchema(routes: RouteInfo[], executor: RouteExecutor, opts: 
           const dupKey = `${kind}|${leafDomain.join(':')}|${leaf.fieldName}`
           const existing = seenFields.get(dupKey)
           if (existing) {
+            // Dedicated class (catchable by type) + the message prefix, so
+            // message-matching assertions keep working too.
             throw new DuplicateFieldError(
-              `'${leaf.fieldName}' in domain '${leafDomain.join(':')}' ` +
+              `DuplicateFieldError: '${leaf.fieldName}' in domain '${leafDomain.join(':')}' ` +
                 `(already used by ${existing}). Give the routes distinct operationId values.`,
             )
           }
@@ -332,8 +344,14 @@ export function buildSchema(routes: RouteInfo[], executor: RouteExecutor, opts: 
             args: leaf.args as never,
             description: leaf.description,
             ...(leaf.deprecationReason ? { deprecationReason: leaf.deprecationReason } : {}),
-            resolve: (_src, args, ctx) =>
-              executor.call(leaf.plan, args as Record<string, unknown>, (ctx as { headers?: never } | undefined)?.headers),
+            resolve: (_src, args, ctx) => {
+              const context = ctx as ExecutionContext | undefined
+              const invoke = () =>
+                executor.call(leaf.plan, args as Record<string, unknown>, context?.headers)
+              // Writes serialized per document — see SerialQueue. Reads stay
+              // concurrent: sibling fields still overlap freely.
+              return kind === 'mutation' && context?.writer ? context.writer.run(invoke) : invoke()
+            },
           }
           fields[leaf.fieldName] = field
           ;(kind === 'mutation' ? mutationFields : queryFields).set(`${leafDomain.join(':')}|${leaf.fieldName}`, field)
@@ -377,10 +395,12 @@ export function buildSchema(routes: RouteInfo[], executor: RouteExecutor, opts: 
     skips,
     degraded,
     degradedFields: mapper.degradations,
+    renames: mapper.renames,
     registry,
     queryFields,
     mutationFields,
     routeCount: leaves.query.length + leaves.mutation.length,
     domains: registry.summary().map((s) => s.name),
+    hasQueryOperations: leaves.query.length > 0,
   }
 }

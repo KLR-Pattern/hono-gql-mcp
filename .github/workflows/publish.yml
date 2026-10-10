@@ -1,0 +1,62 @@
+name: publish
+
+# Publishing is a tag push: `git tag v0.1.0 && git push --tags`.
+# The tag must match package.json's version — the version-check step fails on a
+# mismatch, because npm would otherwise reject (or worse, mis-tag) the release
+# after a successful build.
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  # The same job the PR gate runs (ci.yml), so a green pull request and a green
+  # release mean the same thing. Nothing is published unless it passes.
+  verify:
+    uses: ./.github/workflows/test.yml
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    # Trusted publishing: the job exchanges a GitHub OIDC token for a
+    # short-lived npm credential. No NPM_TOKEN secret is stored anywhere.
+    # npm's Trusted Publisher settings for this package must name this repo
+    # and this workflow file (publish.yml).
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - run: npm ci
+
+      - name: Check the tag matches package.json
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p 'require("./package.json").version')"
+          echo "tag=$tag package.json=$pkg"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $pkg"
+            exit 1
+          fi
+
+      # prepublishOnly runs `npm run build` on its own; this call is explicit so
+      # a build failure is reported as itself rather than inside npm publish.
+      - run: npm run build
+
+      # --provenance attaches a signed statement linking the tarball to this
+      # commit and workflow run. --access public keeps the package installable
+      # without a paid plan (scoped packages default to restricted).
+      #
+      # If this step fails with E404 ("PUT ... Not found") even though the
+      # provenance statement was signed above, the cause is the trusted
+      # publisher's Allowed actions list, not a missing package: npm answers
+      # 404 rather than 403 for an unauthorized write. Ticking only the default
+      # (`npm stage publish`) leaves `npm publish` refused. Enable `npm publish`
+      # in the package's Settings -> Trusted Publisher, then re-run this job.
+      - run: npm publish --provenance --access public

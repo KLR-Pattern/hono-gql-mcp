@@ -39,6 +39,36 @@ export interface ExecutorHardening {
   maxConcurrency: number | null
 }
 
+/**
+ * The GraphQL contextValue the handler builds for one execute() call.
+ * `writer` is the document's mutation queue (see SerialQueue).
+ */
+export interface ExecutionContext {
+  headers?: IncomingHeaders
+  writer?: SerialQueue
+}
+
+/**
+ * Serial FIFO queue for one execute() call's mutation fields.
+ *
+ * graphql-js serializes ROOT mutation fields, but our write fields do not live
+ * at the root: tags wrap them in a domain-group object type, so the root holds
+ * a single group field and the writes beneath it resolve CONCURRENTLY — the
+ * spec's document-order guarantee was lost by the grouping. Resolvers reach
+ * this queue in document order (graphql-js walks the selection set in order),
+ * so a FIFO chain restores it. A failed task does not block its successors.
+ */
+export class SerialQueue {
+  #tail: Promise<unknown> = Promise.resolve()
+
+  run<T>(task: () => Promise<T>): Promise<T> {
+    // Both handlers run the task: a rejected predecessor must not stall the queue.
+    const result = this.#tail.then(task, task)
+    this.#tail = result.catch(() => {})
+    return result
+  }
+}
+
 /** FIFO semaphore — a released permit is handed straight to the next waiter. */
 class Semaphore {
   #permits: number
@@ -110,7 +140,12 @@ export class RouteExecutor {
     const queryShape = (route.request?.query as { shape?: Record<string, unknown> } | undefined)?.shape
     for (const key of Object.keys(queryShape ?? {})) {
       const v = args[key]
-      if (v !== undefined) query.set(key, String(v))
+      if (v === undefined || v === null) continue
+      // An array arg is a repeated key (?tags=a&tags=b), which is what Hono's
+      // query parser collects back into an array. `set` would join it to
+      // 'a,b' and the route's own z.array() validation would answer 400.
+      if (Array.isArray(v)) for (const item of v) query.append(key, String(item))
+      else query.set(key, String(v))
     }
     const url = query.size > 0 ? `${path}?${query}` : path
 

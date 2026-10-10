@@ -36,7 +36,7 @@ import {
   type DegradedRecord,
   type SkipRecord,
 } from './schema-builder.ts'
-import { RouteExecutor } from './executor.ts'
+import { RouteExecutor, SerialQueue } from './executor.ts'
 import { LruCache } from './lru.ts'
 import type { DomainRegistry } from './domains.ts'
 import { withExecuteSpan } from './otel.ts'
@@ -64,6 +64,12 @@ export interface ReadinessReport {
   skips: SkipRecord[]
   degraded: DegradedRecord[]
   degradedFields: Array<[string, string]>
+  /**
+   * Type names that had to be disambiguated (two schemas sharing a
+   * `.meta({ title })`). Informational: renaming costs no capability and does
+   * NOT affect `ready`.
+   */
+  renames: Array<[string, string]>
 }
 
 /** `null` means "off" and must survive the default — only `undefined` takes the default. */
@@ -102,7 +108,22 @@ interface FrontHalf {
   errors: readonly GraphQLError[]
 }
 
-/** Max selection-set nesting of a document; fragments resolved by name, cycles guarded. Root set = depth 1. */
+/**
+ * Max selection-set nesting of a document; fragments resolved by name, cycles
+ * guarded. Root set = depth 1.
+ *
+ * Fragments do NOT add depth: an inline fragment or a spread contributes its
+ * fields to the SAME selection set it appears in (GraphQL inlines both before
+ * execution), so `{ ...F }` and F's own selections nest identically. Counting a
+ * level for them made a fragment-organized document measure one deeper than the
+ * same document written inline — `maxDepth: 10` would reject a legal query.
+ *
+ * Introspection meta-fields (`__`-prefixed) do not count toward depth:
+ * standard tooling (GraphiQL, codegen, IDE plugins) ships a fixed, deep
+ * introspection document — depth ~16 — whose shape is bounded by the schema
+ * itself, not by the caller. The guard targets runaway DATA selections.
+ * (Python parity: fastapi-gql-mcp's depth_guard.py skips them the same way.)
+ */
 export function documentDepth(document: DocumentNode): number {
   const fragments = new Map<string, FragmentDefinitionNode>()
   for (const def of document.definitions) {
@@ -114,15 +135,16 @@ export function documentDepth(document: DocumentNode): number {
     for (const sel of set.selections) {
       switch (sel.kind) {
         case 'Field':
+          if (sel.name.value.startsWith('__')) break // introspection: bounded by the schema, not the caller
           if (sel.selectionSet) visit(sel.selectionSet, depth + 1, seenFragments)
           break
         case 'InlineFragment':
-          if (sel.selectionSet) visit(sel.selectionSet, depth + 1, seenFragments)
+          if (sel.selectionSet) visit(sel.selectionSet, depth, seenFragments)
           break
         case 'FragmentSpread': {
           const frag = fragments.get(sel.name.value)
           if (frag && !seenFragments.has(frag.name.value)) {
-            visit(frag.selectionSet, depth + 1, new Set(seenFragments).add(frag.name.value))
+            visit(frag.selectionSet, depth, new Set(seenFragments).add(frag.name.value))
           }
           break
         }
@@ -142,6 +164,8 @@ export class RouterGraphQLHandler {
   readonly skips: SkipRecord[]
   readonly degraded: DegradedRecord[]
   readonly degradedFields: Array<[string, string]>
+  /** Type names disambiguated at build time — informational, never a readiness failure. */
+  readonly renames: Array<[string, string]>
   readonly registry: DomainRegistry
   readonly queryFields: Map<string, GraphQLFieldConfig<unknown, unknown>>
   readonly mutationFields: Map<string, GraphQLFieldConfig<unknown, unknown>>
@@ -151,6 +175,12 @@ export class RouterGraphQLHandler {
   readonly domains: string[]
   /** The filtered RouteInfo list, for callers that want the raw scan. */
   readonly routes: RouteInfo[]
+  /**
+   * False when no read route survived the scan — `type Query` is empty, which
+   * makes the schema invalid to graphql-js. execute() refuses documents with a
+   * typed error instead of letting assertValidSchema throw a raw Error.
+   */
+  readonly hasQueryOperations: boolean
   readonly #maxDepth: number | null
   readonly #cache: LruCache<FrontHalf>
   #sdl?: string
@@ -172,11 +202,13 @@ export class RouterGraphQLHandler {
     this.skips = built.skips
     this.degraded = built.degraded
     this.degradedFields = built.degradedFields
+    this.renames = built.renames
     this.registry = built.registry
     this.queryFields = built.queryFields
     this.mutationFields = built.mutationFields
     this.routeCount = built.routeCount
     this.domains = built.domains
+    this.hasQueryOperations = built.hasQueryOperations
     this.#maxDepth = hardening.maxDepth
     this.#cache = new LruCache<FrontHalf>(hardening.documentCacheSize)
   }
@@ -185,13 +217,18 @@ export class RouterGraphQLHandler {
     return (this.#sdl ??= printSchema(this.schema))
   }
 
-  /** The exposure audit — `assert report.ready` in CI pins what the bridge serves. */
+  /**
+   * The exposure audit — `assert report.ready` in CI pins what the bridge
+   * serves. Only skips and degradations count against `ready`; `renames` is
+   * reported for visibility but is not a capability loss.
+   */
   readiness(): ReadinessReport {
     return {
       ready: this.skips.length === 0 && this.degraded.length === 0 && this.degradedFields.length === 0,
       skips: this.skips,
       degraded: this.degraded,
       degradedFields: this.degradedFields,
+      renames: this.renames,
     }
   }
 
@@ -221,6 +258,22 @@ export class RouterGraphQLHandler {
     variables?: Record<string, unknown>,
     options?: { headers?: Headers | Record<string, string>; operationName?: string },
   ): Promise<ExecutionResult> {
+    // No read route survived the scan, so `type Query` has no fields and
+    // graphql-js treats the whole schema as invalid — every document, even a
+    // syntactically fine one, makes assertValidSchema throw a raw Error. Answer
+    // with a typed GraphQLError that names the real cause instead.
+    if (!this.hasQueryOperations) {
+      return {
+        errors: [
+          new GraphQLError(
+            'NO_QUERY_OPERATIONS: the derived schema has no fields on type Query, ' +
+              `so nothing can be executed. ${this.skips.length} route(s) were skipped, ` +
+              `${this.mutationFields.size} write route(s) derived. Add a readable route (GET/HEAD) ` +
+              'or widen the path/tag filters.',
+          ),
+        ],
+      }
+    }
     const cached = this.#cache.get(query)
     let front: FrontHalf
     if (cached) {
@@ -241,12 +294,15 @@ export class RouterGraphQLHandler {
       front.document.definitions.find((def) => def.kind === 'OperationDefinition')?.operation ?? 'unknown'
     return withExecuteSpan(async (span) => {
       span.setAttribute('graphql.operation', operation)
+      // Per-call mutation queue: graphql-js serializes root mutation fields,
+      // but ours sit under a domain-group field and would run concurrently.
+      // Fresh per execute() — two in-flight documents never serialize together.
       const result = await execute({
         schema: this.schema,
         document: front.document,
         variableValues: variables,
         operationName: options?.operationName,
-        contextValue: { headers: options?.headers },
+        contextValue: { headers: options?.headers, writer: new SerialQueue() },
       })
       if (result.errors?.length) span.setAttribute('graphql.errors', result.errors.length)
       return result

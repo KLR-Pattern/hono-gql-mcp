@@ -1,0 +1,12 @@
+{
+  "$comment": "Emit config only — `npm run typecheck` keeps using tsconfig.json (noEmit). Sources import each other as './x.ts' so Node's type-stripping runner can execute them directly; rewriteRelativeImportExtensions turns those into './x.js' in the emitted JS. Consumers only ever see dist/.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "declaration": true,
+    "rewriteRelativeImportExtensions": true
+  },
+  "include": ["src"]
+}

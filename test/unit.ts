@@ -48,20 +48,20 @@ test('documentDepth: plain nesting counts selection sets (root = 1)', () => {
   assert.equal(documentDepth(parse('{ a { b { c } } }')), 3)
 })
 
-test('documentDepth: inline fragments nest by one', () => {
-  assert.equal(documentDepth(parse('{ a { ... on T { b { c } } } }')), 4)
+test('documentDepth: inline fragments contribute to the SAME level (no extra nesting)', () => {
+  // GraphQL inlines fragments before execution, so `{ a { ... on T { b { c } } } }`
+  // nests identically to `{ a { b { c } } }`.
+  assert.equal(documentDepth(parse('{ a { ... on T { b { c } } } }')), 3)
 })
 
-test('documentDepth: fragment spreads nest by one', () => {
-  // The spread itself costs a level: { a { ...F } } + F { b { c } } is one
-  // deeper than the spread-free { a { b { c } } } (depth 3).
+test('documentDepth: fragment spreads nest identically to the inlined document', () => {
   const doc = parse('{ a { ...F } } fragment F on T { b { c } }')
-  assert.equal(documentDepth(doc), 4)
+  assert.equal(documentDepth(doc), 3)
 })
 
 test('documentDepth: fragment cycles terminate (each fragment counted once per path)', () => {
   const doc = parse('{ a { ...F } } fragment F on T { b { ...F } }')
-  assert.equal(documentDepth(doc), 4) // F's own spread of itself is not re-entered
+  assert.equal(documentDepth(doc), 3) // F's own spread of itself is not re-entered
 })
 
 test('documentDepth: unused fragments do not count', () => {
@@ -127,16 +127,15 @@ test('mapper: enum member names must be legal GraphQL identifiers, else JSON', (
   assert.ok(records[0][1].includes('non-identifier'))
 })
 
-test('mapper: reused type names get a suffix and a degradation record', () => {
+test('mapper: reused type names get a suffix and a renames record (not a degradation)', () => {
   const mapper = new ZodGraphqlMapper()
   const A = mapper.outputType(z.object({ v: z.string() }), 'Thing')
   const B = mapper.outputType(z.object({ w: z.string() }), 'Thing')
   assert.equal(String(A), 'Thing!')
   assert.equal(String(B), 'Thing_2!')
-  assert.ok(
-    mapper.degradations.some(([where, reason]) => where === 'Thing (type name)' && reason.includes('Thing_2')),
-    JSON.stringify(mapper.degradations),
-  )
+  // A rename costs no capability — informational, never a readiness failure.
+  assert.deepEqual(mapper.renames, [['Thing', 'reused → Thing_2']])
+  assert.equal(mapper.degradations.length, 0)
 })
 
 test('mapper: int detection reads both z.int() and z.number().int(); plain number → Float', () => {

@@ -87,6 +87,22 @@ export interface ResolvedAuth {
   toolScopes?: Record<string, string[]>
 }
 
+/**
+ * Constant-time string equality — no early exit on the first differing byte
+ * (plain `===` short-circuits and leaks a match-length timing signal), and
+ * the loop always runs over the LONGER input so the secret's length leaks
+ * nothing either. Runtime-agnostic: no node:crypto, so the bridge stays
+ * usable on non-Node runtimes.
+ */
+function safeEqual(a: string, b: string): boolean {
+  const len = Math.max(a.length, b.length)
+  let diff = a.length ^ b.length
+  for (let i = 0; i < len; i++) {
+    diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0)
+  }
+  return diff === 0
+}
+
 /** Resolve user options into the SDK gate (throws HonoGqlMcpConfigError on bad combinations). */
 export function resolveAuth(opts: AuthOptions): ResolvedAuth {
   const sources = [
@@ -122,7 +138,7 @@ export function resolveAuth(opts: AuthOptions): ResolvedAuth {
     const scopes = shared.scopes ?? requiredScopes
     verifier = {
       async verifyAccessToken(token) {
-        if (token !== shared.secret) throw new OAuthError(OAuthErrorCode.InvalidToken, 'invalid token')
+        if (!safeEqual(token, shared.secret)) throw new OAuthError(OAuthErrorCode.InvalidToken, 'invalid token')
         // Rolling expiry: the minted AuthInfo lives for the gate check only.
         return { token, clientId: 'shared-secret', scopes, expiresAt: Math.floor(Date.now() / 1000) + 3600 }
       },

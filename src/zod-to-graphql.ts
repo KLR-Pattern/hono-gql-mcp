@@ -156,6 +156,14 @@ export class ZodGraphqlMapper {
   private names = new Set<string>(['Query', 'Mutation', 'JSON', 'Date', 'String', 'Int', 'Float', 'Boolean', 'ID'])
   /** Degradation audit: `[where, reason]` tuples, surfaced as startup notices and readiness().degradedFields. */
   readonly degradations: Array<[string, string]> = []
+  /**
+   * Name disambiguations — a second `.meta({ title })` reusing a taken name.
+   * Kept apart from `degradations` on purpose: GraphQL has one global type
+   * namespace, so renaming is unavoidable and costs no capability. It is
+   * reported (readiness().renames) but must not mark the bridge unready — a
+   * CI `assert report.ready` gate has to stay meaningful.
+   */
+  readonly renames: Array<[string, string]> = []
 
   // ---- output side -------------------------------------------------------
 
@@ -331,7 +339,7 @@ export class ZodGraphqlMapper {
     if (this.names.has(name)) {
       let n = 2
       while (this.names.has(`${name}_${n}`)) n++
-      this.degradations.push([`${name} (type name)`, `reused → ${name}_${n}`])
+      this.renames.push([name, `reused → ${name}_${n}`])
       name = `${name}_${n}`
     }
     this.names.add(name)

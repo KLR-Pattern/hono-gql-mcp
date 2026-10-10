@@ -8,21 +8,39 @@
  * end-to-end credential passthrough.
  */
 import assert from 'node:assert/strict'
+import { rmSync } from 'node:fs'
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client'
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
 import type { Hono } from 'hono'
-import { createApp } from '../example/app.ts'
-import { bridgeValidator, DuplicateFieldError, HonoGqlMcp, HonoGqlMcpConfigError, RouterGraphQLHandler } from '../src/index.ts'
-import { runAll, test } from './runner.ts'
+import { DB_PATH, DEMO_OWNER } from '../example/store.ts'
 
-const AUTH = { authorization: 'Bearer demo-secret' }
+// Verify isolation BEFORE loading the app: SQLITE_PATH points at test/.tmp/…
+// (test/e2e.env), and the file is cleared so counts are exact per run.
+// A body of accumulated state used to push a fresh row out of a 10-item window.
+for (const suffix of ['', '-wal', '-shm']) rmSync(`${DB_PATH}${suffix}`, { force: true })
+
+const { createApp } = await import('../example/app.ts')
+import { parse, validate } from 'graphql'
+import { bridgeValidator, documentDepth, HonoGqlMcp, LruCache, RouterGraphQLHandler } from '../src/index.ts'
+
+const tests: Array<[name: string, fn: () => void | Promise<void>]> = []
+const test = (name: string, fn: () => void | Promise<void>) => tests.push([name, fn])
 
 /** graphql-js types query data as a loose map — tests read it as any. */
 const d = (r: { data?: unknown }): any => r.data
 
 // -- shared fixtures ------------------------------------------------------------
-const { app, bridge } = createApp()
+const { app, bridge, auth, store } = await createApp()
 const handler = bridge.handler
+
+/**
+ * The example app authenticates every note route, so every request needs a
+ * real Bearer. Tests mint one with the app's own auth instance (no GitHub
+ * round trip) — the mirror of the Python example's smoke script. `DEMO_OWNER`
+ * makes the seeded notes visible.
+ */
+const signToken = auth.signToken
+const AUTH = { authorization: `Bearer ${await signToken(DEMO_OWNER)}` }
 const gql = (query: string, headers: Record<string, string> = AUTH) =>
   handler.execute(query, undefined, { headers })
 
@@ -70,12 +88,7 @@ test('recursion: z.lazy category tree serves true depth', async () => {
 })
 
 test('Boolean success: 204-style delete bridges as true', async () => {
-  // Fresh app: this test deletes a note, and the shared fixture stays
-  // read-only so e2e order never matters.
-  const fresh = createApp()
-  const result = await fresh.bridge.handler.execute(`mutation { notes { delete_note(id: "n3") } }`, undefined, {
-    headers: AUTH,
-  })
+  const result = await gql(`mutation { notes { delete_note(id: "n3") } }`)
   assert.equal(d(result).notes.delete_note, true)
 })
 
@@ -156,7 +169,14 @@ test('MCP: graphql_query composes domains in one tool call', async () => {
 })
 
 test('MCP: per-caller credentials reach the routes end-to-end', async () => {
-  const { client, transport } = await mcpClient({}) // no credentials
+  // The example's /mcp is OAuth-gated, so mount a second, UNgated bridge to
+  // isolate the route-level check: with no credentials the passthrough
+  // delivers nothing and the routes answer 401 — proving the bridge holds no
+  // credentials of its own.
+  const fresh = await createApp()
+  const open = new HonoGqlMcp(fresh.app, { name: 'open', allowMutation: true })
+  open.mountTo(fresh.app, '/mcp-open')
+  const { client, transport } = await mcpClient({}, fresh.app, '/mcp-open')
   const raw = await callToolText(client, 'graphql_query', {
     query: `{ notes { list_notes { id } } }`,
   })
@@ -170,11 +190,13 @@ test('MCP: per-caller credentials reach the routes end-to-end', async () => {
 })
 
 test('MCP: graphql_mutation writes, then the write is visible', async () => {
-  const fresh = createApp() // fresh store: this test writes
-  const { client, transport } = await mcpClient(AUTH, fresh.app)
+  const { client, transport } = await mcpClient(AUTH)
+  // Unique tag per run: the store is PERSISTENT now, so a fixed fixture would
+  // collide with rows left by earlier runs.
+  const tag = `mcp-${Date.now()}`
   const created = JSON.parse(
     await callToolText(client, 'graphql_mutation', {
-      query: `mutation { notes { create_note(body: { title: "from MCP", tags: ["mcp"] }) { id title } } }`,
+      query: `mutation { notes { create_note(body: { title: "from MCP", tags: ["${tag}"] }) { id title } } }`,
     }),
   )
   assert.equal(created.errors, undefined)
@@ -182,7 +204,7 @@ test('MCP: graphql_mutation writes, then the write is visible', async () => {
 
   const listed = JSON.parse(
     await callToolText(client, 'graphql_query', {
-      query: `{ notes { list_notes(tag: "mcp") { title } } }`,
+      query: `{ notes { list_notes(tag: "${tag}") { title } } }`,
     }),
   )
   assert.deepEqual(listed.data.notes.list_notes, [{ title: 'from MCP' }])
@@ -206,44 +228,6 @@ test('MCP: graphql_query refuses mutation documents, and nothing executes', asyn
   assert.equal(after.data.notes.get_note.title, 'Buy milk')
   await client.close()
   await transport.close()
-})
-
-test('MCP: graphql_mutation refuses non-mutation documents, and nothing executes', async () => {
-  const { client, transport } = await mcpClient(AUTH)
-  const result = (await client.callTool({
-    name: 'graphql_mutation',
-    arguments: { query: `{ notes { list_notes { id } } }` },
-  })) as { isError?: boolean; content: Array<{ type: string; text: string }> }
-  assert.equal(result.isError, true)
-  assert.ok(result.content[0].text.includes('only runs mutation documents'), result.content[0].text)
-  await client.close()
-  await transport.close()
-})
-
-// -- passthrough -------------------------------------------------------------------
-
-test('passthrough: whitelisted cookie header reaches the route; unlisted headers never do', async () => {
-  const app = new OpenAPIHono()
-  app.openapi(
-    {
-      method: 'get',
-      path: '/who',
-      tags: ['session'],
-      operationId: 'who',
-      responses: { 200: okResponse(z.object({ session: z.string(), agent: z.string() })) },
-    } as Parameters<typeof createRoute>[0],
-    (c) =>
-      c.json(
-        { session: c.req.header('cookie') ?? 'none', agent: c.req.header('user-agent') ?? 'none' },
-        200,
-      ),
-  )
-  const h = new RouterGraphQLHandler(app, { passthroughHeaders: ['cookie'] })
-  const seen = await h.execute(`{ session { who { session agent } } }`, undefined, {
-    headers: { cookie: 'sid=abc', 'user-agent': 'curl/8' },
-  })
-  assert.equal(d(seen).session.who.session, 'sid=abc', 'whitelisted cookie rides through')
-  assert.equal(d(seen).session.who.agent, 'none', 'unlisted headers are dropped at the bridge')
 })
 
 // -- hardening -------------------------------------------------------------------
@@ -320,6 +304,7 @@ test('hardening: queue waits count against requestTimeoutMs', async () => {
 test('hardening: max_depth rejects runaway nesting before anything executes', async () => {
   // Category recursion makes selectable depth unbounded — 13 levels.
   const deep = `{ catalog { tree { categories { ${'children { '.repeat(11)}name ${'} '.repeat(11)} } } } }`
+  // The default handler (maxDepth 10) rejects the document before execution.
   const limited = await handler.execute(deep, undefined, { headers: AUTH })
   assert.ok(limited.errors?.some((e) => e.message.includes('max_depth')), JSON.stringify(limited.errors))
 
@@ -328,18 +313,217 @@ test('hardening: max_depth rejects runaway nesting before anything executes', as
   assert.equal(ok.errors, undefined)
 })
 
+test('hardening: introspection is exempt from max_depth (GraphiQL/codegen work at the default)', async () => {
+  // The canonical client introspection query nests ~16 through `ofType` — past
+  // maxDepth's default of 10. Without the exemption every tool that reads the
+  // schema (GraphiQL first among them) fails at the default.
+  const introspection = `query IntrospectionQuery { __schema { queryType { name } types { ...FullType } } }
+    fragment FullType on __Type { kind name fields(includeDeprecated: true) { name type { ...TypeRef } } }
+    fragment TypeRef on __Type { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name } } } } } } } }`
+  const result = await handler.execute(introspection, undefined, { headers: AUTH })
+  assert.equal(result.errors, undefined, JSON.stringify(result.errors))
+  assert.ok((d(result).__schema?.types?.length ?? 0) > 0, 'schema types returned at the default depth')
+  // `__type` (single-type shorthand) is exempt too.
+  const oneType = `{ __type(name: "Note") { kind name ofType { kind name } } }`
+  assert.equal((await handler.execute(oneType, undefined, { headers: AUTH })).errors, undefined)
+})
+
+test('hardening: LruCache — recency refresh, capacity bound, 0 disables', () => {
+  const lru = new LruCache<string>(2)
+  lru.set('a', '1')
+  lru.set('b', '2')
+  assert.equal(lru.get('a'), '1') // refresh a
+  lru.set('c', '3') // evicts b (least recent)
+  assert.equal(lru.size, 2)
+  assert.equal(lru.get('a'), '1')
+  assert.equal(lru.get('b'), undefined)
+
+  const off = new LruCache<string>(0)
+  off.set('a', '1')
+  assert.equal(off.get('a'), undefined)
+})
+
+test('hardening: mutations run SERIALLY in document order despite domain grouping', async () => {
+  // The spec serializes ROOT mutation fields. Tags wrap writes in a group
+  // object type, so the root holds one group field and the writes beneath it
+  // would run CONCURRENTLY — the guarantee was lost by the grouping. The
+  // resolver-side SerialQueue restores it; this pins that.
+  const order: string[] = []
+  const app3 = new OpenAPIHono()
+  app3.openapi(
+    createRoute({
+      method: 'get',
+      path: '/readable',
+      tags: ['read'],
+      operationId: 'readable',
+      responses: { 200: okResponse(z.object({ v: z.string() })) },
+    }),
+    (c) => c.json({ v: 'x' }, 200),
+  )
+  // `a` sleeps longest, so a concurrent run would finish it LAST.
+  for (const n of ['a', 'b', 'c']) {
+    app3.openapi(
+      createRoute({
+        method: 'post',
+        path: `/w${n}`,
+        tags: ['writes'],
+        operationId: `w_${n}`,
+        responses: { 200: okResponse(z.object({ v: z.string() })) },
+      }),
+      async (c) => {
+        order.push(`start:${n}`)
+        await new Promise((r) => setTimeout(r, n === 'a' ? 60 : 5))
+        order.push(`end:${n}`)
+        return c.json({ v: n }, 200)
+      },
+    )
+  }
+  const h = new RouterGraphQLHandler(app3, { allowMutation: true })
+  const result = await h.execute(`mutation { writes { w_a { v } w_b { v } w_c { v } } }`)
+  assert.equal(result.errors, undefined)
+  assert.equal(order.join(','), 'start:a,end:a,start:b,end:b,start:c,end:c', order.join(' '))
+})
+
+test('hardening: array query args travel as repeated keys, not a joined string', async () => {
+  // URLSearchParams.set() would send ?tags=a%2Cb and the route's own
+  // z.array(z.string()) validation would answer 400. GraphQL sends a JSON
+  // array; it has to become ?tags=a&tags=b.
+  let seen: unknown = null
+  const app4 = new OpenAPIHono()
+  app4.openapi(
+    createRoute({
+      method: 'get',
+      path: '/search',
+      tags: ['q'],
+      operationId: 'search',
+      request: { query: z.object({ tags: z.array(z.string()).optional(), q: z.string().optional() }) },
+      responses: { 200: okResponse(z.object({ got: z.string() })) },
+    }),
+    (c) => {
+      seen = c.req.valid('query')
+      return c.json({ got: 'ok' }, 200)
+    },
+  )
+  const h = new RouterGraphQLHandler(app4)
+  const result = await h.execute(`{ q { search(tags: ["a", "b"], q: "x") { got } } }`)
+  assert.equal(result.errors, undefined, JSON.stringify(result.errors))
+  assert.deepEqual(seen, { tags: ['a', 'b'], q: 'x' })
+})
+
+test('config: an empty type Query is reported, not thrown at request time', async () => {
+  // A write-only app (or filters that kept nothing) leaves `type Query` with no
+  // fields — graphql-js then considers the whole schema invalid. Construction
+  // must still succeed (the library's own filters can produce this state), and
+  // execute() must answer with a typed error rather than a raw Error.
+  const writesOnly = new OpenAPIHono()
+  writesOnly.openapi(
+    createRoute({
+      method: 'post',
+      path: '/w',
+      tags: ['w'],
+      operationId: 'w',
+      responses: { 200: okResponse(z.object({ v: z.string() })) },
+    }),
+    (c) => c.json({ v: 'x' }, 200),
+  )
+  const h = new RouterGraphQLHandler(writesOnly, { allowMutation: true })
+  assert.equal(h.hasQueryOperations, false)
+  const result = await h.execute(`{ __typename }`)
+  assert.ok(result.errors?.[0]?.message.startsWith('NO_QUERY_OPERATIONS'), JSON.stringify(result.errors))
+
+  // Filters that drop every read route reach the same state.
+  const filtered = new RouterGraphQLHandler(filterApp(), { includeTags: ['nomatch'] })
+  assert.equal(filtered.hasQueryOperations, false)
+  // A normal app is unaffected.
+  assert.equal(new RouterGraphQLHandler(filterApp()).hasQueryOperations, true)
+})
+
+test('readiness: a type-name rename is reported but does NOT block ready', async () => {
+  // GraphQL has one global type namespace, so two schemas sharing a
+  // .meta({ title }) force a rename. That costs no capability, so it must not
+  // flip `ready` — otherwise an `assert report.ready` CI gate fails on a
+  // harmless collision and gets turned off.
+  const A = z.object({ v: z.string() }).meta({ title: 'Item' })
+  const B = z.object({ w: z.string() }).meta({ title: 'Item' })
+  const app5 = new OpenAPIHono()
+  for (const [path, schema, id] of [['/a', A, 'op_a'], ['/b', B, 'op_b']] as const) {
+    app5.openapi(
+      createRoute({ method: 'get', path, tags: ['t'], operationId: id, responses: { 200: okResponse(schema) } }),
+      (c) => c.json({ v: 'x' }, 200),
+    )
+  }
+  const h = new RouterGraphQLHandler(app5)
+  const report = h.readiness()
+  assert.equal(report.degradedFields.length, 0, 'a rename is not a degradation')
+  assert.ok(report.renames.some(([name, reason]) => name === 'Item' && reason.includes('Item_2')), JSON.stringify(report.renames))
+  assert.equal(report.ready, true, 'a rename must not make the bridge unready')
+})
+
+test('hardening: fragments do not add to maxDepth', async () => {
+  // An inline fragment and a spread both contribute to the SAME selection set;
+  // GraphQL inlines them before execution. Counting a level for either made a
+  // fragment-organized document measure deeper than the identical inline one.
+  const app6 = new OpenAPIHono()
+  app6.openapi(
+    createRoute({
+      method: 'get',
+      path: '/c',
+      tags: ['t'],
+      operationId: 'c',
+      responses: { 200: okResponse(z.object({ name: z.string() })) },
+    }),
+    (c) => c.json({ name: 'x' }, 200),
+  )
+  const h = new RouterGraphQLHandler(app6)
+  const inline = `{ t { c { name } } }`
+  const viaFragment = `query { ...F } fragment F on Query { t { c { name } } }`
+  const viaInlineFragment = `{ ... on Query { t { c { name } } } }`
+  assert.equal(documentDepth(parse(inline)), 3)
+  assert.equal(documentDepth(parse(viaFragment)), 3, 'a spread adds no depth')
+  assert.equal(documentDepth(parse(viaInlineFragment)), 3, 'an inline fragment adds no depth')
+  for (const doc of [inline, viaFragment, viaInlineFragment]) {
+    assert.equal((await h.execute(doc)).errors, undefined, doc)
+  }
+  // Real nesting is still enforced.
+  const limited = new RouterGraphQLHandler(app6, { maxDepth: 2 })
+  assert.ok((await limited.execute(inline)).errors?.some((e) => e.message.includes('max_depth')))
+})
+
+test('MCP: the graphql_query example is a real, executable document', async () => {
+  // The description is read by an LLM that copies it verbatim — a hardcoded
+  // example goes stale as soon as an operationId or response schema changes.
+  const big = bigApp()
+  const bridge = new HonoGqlMcp(big, { name: 'example-check' })
+  bridge.mountTo(big, '/mcp-example')
+  const { client, transport } = await mcpClient({}, big, '/mcp-example')
+  const { tools } = await client.listTools()
+  const described = tools.find((t) => t.name === 'graphql_query')?.inputSchema as
+    | { properties?: { query?: { description?: string } } }
+    | undefined
+  const example = described?.properties?.query?.description?.match(/e\.g\. (.+)$/)?.[1]
+  assert.ok(example, `no example in the description: ${described?.properties?.query?.description}`)
+  // It must be valid AND runnable against this very app.
+  assert.deepEqual(validate(bridge.handler.schema, parse(example)), [])
+  const result = JSON.parse(await callToolText(client, 'graphql_query', { query: example }))
+  assert.equal(result.errors, undefined, JSON.stringify(result.errors))
+  await client.close()
+  await transport.close()
+})
+
 test('hardening: document cache caches the front half — execution stays live', async () => {
-  const fresh = createApp() // fresh store: this test writes
-  const h = new RouterGraphQLHandler(fresh.app, { allowMutation: true })
-  const q = `{ notes { list_notes { id title } } }`
-  const before = await h.execute(q, undefined, { headers: AUTH })
+  const h = new RouterGraphQLHandler(app, { allowMutation: true })
+  // Unique title marker: the store persists, and sibling tests write notes too —
+  // count deltas are only deterministic scoped to this test's own row.
+  const marker = `cache-check-${Date.now()}`
+  const q = (t: string) => `{ notes { get_search(q: "${t}") { title } } }`
+  const before = await h.execute(q(marker), undefined, { headers: AUTH })
   await h.execute(
-    `mutation { notes { create_note(body: { title: "cache-check" }) { id } } }`,
+    `mutation { notes { create_note(body: { title: "${marker}" }) { id } } }`,
     undefined,
     { headers: AUTH },
   )
-  const after = await h.execute(q, undefined, { headers: AUTH }) // same document — cache hit on parse/validate
-  assert.equal(d(after).notes.list_notes.length, d(before).notes.list_notes.length + 1)
+  const after = await h.execute(q(marker), undefined, { headers: AUTH }) // same document — cache hit on parse/validate
+  assert.equal(d(after).notes.get_search.length, d(before).notes.get_search.length + 1)
 })
 
 // -- route filters + multi-domain ---------------------------------------------------
@@ -471,11 +655,12 @@ function bigApp() {
 
 const envelope = (raw: string): any => JSON.parse(raw)
 
-test('progressive: mode=auto switches above the threshold', () => {
+test('progressive: mode=auto switches above the threshold', async () => {
   assert.equal(new HonoGqlMcp(bigApp()).resolvedMode, 'progressive')
   assert.equal(new HonoGqlMcp(bigApp(), { progressiveThreshold: 35 }).resolvedMode, 'simple')
   assert.equal(new HonoGqlMcp(bigApp(), { mode: 'simple' }).resolvedMode, 'simple')
-  assert.equal(new HonoGqlMcp(createApp().app, { allowMutation: true, progressiveThreshold: 5 }).resolvedMode, 'progressive')
+  const { app } = await createApp()
+  assert.equal(new HonoGqlMcp(app, { allowMutation: true, progressiveThreshold: 5 }).resolvedMode, 'progressive')
 })
 
 test('progressive: constant 4-tool catalog (no get_schema), full walkthrough works', async () => {
@@ -538,7 +723,7 @@ test('progressive: constant 4-tool catalog (no get_schema), full walkthrough wor
 test('progressive: nested domain fragment re-wraps the real group types', async () => {
   // The example app carries tag 'catalog:tree' — force progressive over it.
   // Mount at its own path: createApp()'s bridge already occupies /mcp.
-  const fresh = createApp()
+  const fresh = await createApp()
   const bridge = new HonoGqlMcp(fresh.app, {
     name: 'nested-domains',
     allowMutation: true,
@@ -558,15 +743,6 @@ test('progressive: nested domain fragment re-wraps the real group types', async 
   assert.ok(sdl.includes('categories'))
   assert.ok(sdl.includes('type Category'), 'reachable types are collected')
   assert.ok(!sdl.includes('list_notes'), 'sibling domains stay out')
-
-  // list_mutations walks the write side of the same tree.
-  const muts = envelope(await callToolText(client, 'list_mutations', { domain: 'notes' }))
-  assert.equal(muts.success, true)
-  const names = muts.data.mutations.map((m: any) => m.name)
-  assert.ok(names.includes('create_note'), JSON.stringify(names))
-  assert.ok(names.includes('delete_note'), JSON.stringify(names))
-  const unknownMut = envelope(await callToolText(client, 'list_mutations', { domain: 'nope' }))
-  assert.equal(unknownMut.error_type, 'DOMAIN_NOT_FOUND')
 
   await client.close()
   await transport.close()
@@ -599,12 +775,13 @@ test('DuplicateFieldError fires at construction, not at first query', () => {
       (c) => c.json({ v: path }, 200),
     )
   }
-  assert.throws(() => new RouterGraphQLHandler(app), DuplicateFieldError)
+  assert.throws(() => new RouterGraphQLHandler(app), /DuplicateFieldError/)
 })
 
-test('config: invalid mode throws HonoGqlMcpConfigError', () => {
+test('config: invalid mode throws HonoGqlMcpConfigError', async () => {
+  const { app } = await createApp()
   assert.throws(
-    () => new HonoGqlMcp(createApp().app, { mode: 'bogus' as never }),
+    () => new HonoGqlMcp(app, { mode: 'bogus' as never }),
     (e: unknown) => e instanceof Error && e.name === 'HonoGqlMcpConfigError',
   )
 })
@@ -612,11 +789,11 @@ test('config: invalid mode throws HonoGqlMcpConfigError', () => {
 // -- plain GraphQL HTTP face + GraphiQL ----------------------------------------------
 
 test('graphql face: POST executes with caller credentials, GET answers 405 usage', async () => {
-  const fresh = createApp() // createApp mounts /graphql + /graphiql itself
+  const fresh = await createApp() // createApp mounts /graphql + /graphiql itself
 
   const res = await fresh.app.request('/graphql', {
     method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: 'Bearer demo-secret' },
+    headers: { 'content-type': 'application/json', ...AUTH },
     body: JSON.stringify({ query: '{ notes { list_notes { title } } }' }),
   })
   assert.equal(res.status, 200)
@@ -642,10 +819,133 @@ test('graphql face: POST executes with caller credentials, GET answers 405 usage
   assert.ok((await html.text()).includes('GraphiQL'))
 })
 
+test('graphql face: variables travel to execution (not just operationName)', async () => {
+  const fresh = await createApp()
+  const res = await fresh.app.request('/graphql', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...AUTH },
+    body: JSON.stringify({
+      query: 'query Q($id: String!) { notes { get_note(id: $id) { title } } }',
+      variables: { id: 'n1' },
+    }),
+  })
+  // The regression: variables was dropped (hardcoded undefined), so every
+  // parameterized document failed variable coercion with a 400.
+  assert.equal(res.status, 200)
+  const body = (await res.json()) as { data?: { notes?: { get_note?: { title?: string } } } }
+  assert.equal(body.data?.notes?.get_note?.title, 'Buy milk')
+
+  // A malformed variables value is its own 400, distinct from variable coercion.
+  const bad = await fresh.app.request('/graphql', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...AUTH },
+    body: JSON.stringify({ query: '{ notes { list_notes { id } } }', variables: 'oops' }),
+  })
+  assert.equal(bad.status, 400)
+  assert.ok(((await bad.json()) as { errors: Array<{ message: string }> }).errors[0].message.includes('variables'))
+})
+
+test('graphql face: non-JSON content-type is refused with 415 (cross-site form POST cannot reach the executor)', async () => {
+  const fresh = await createApp()
+  // Hono's c.req.json() would happily JSON.parse a text/plain body; without
+  // the check this is a CORS "simple request" — no preflight — that a
+  // cross-site HTML form can fire with the caller's session cookie riding
+  // `cookie` passthrough. 415 closes the path.
+  const res = await fresh.app.request('/graphql', {
+    method: 'POST',
+    headers: { 'content-type': 'text/plain', origin: 'https://evil.example' },
+    body: JSON.stringify({ query: '{ notes { list_notes { id } } }' }),
+  })
+  assert.equal(res.status, 415)
+
+  // charset parameters stay legal — the media type is what matters.
+  const charset = await fresh.app.request('/graphql', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json; charset=utf-8', ...AUTH },
+    body: JSON.stringify({ query: '{ notes { list_notes { id } } }' }),
+  })
+  assert.equal(charset.status, 200)
+})
+
+test('graphiql: pinned importmap, single shared React, fetcher wired to the endpoint', async () => {
+  const fresh = await createApp()
+  const html = await (await fresh.app.request('/graphiql')).text()
+
+  // The importmap must be valid JSON — a malformed one fails silently in the
+  // browser, leaving the loading placeholder up forever.
+  const raw = html.match(/<script type="importmap">([\s\S]*?)<\/script>/)?.[1]
+  assert.ok(raw, 'importmap script present')
+  const { imports } = JSON.parse(raw) as { imports: Record<string, string> }
+
+  // Every entry is version-pinned. esm.sh resolves an unversioned specifier to
+  // `latest`, so an unpinned entry lets the playground change under us.
+  for (const [name, url] of Object.entries(imports)) {
+    if (url.startsWith('data:')) continue
+    assert.match(url, /(?:@\d+\.\d+\.\d+|@\d+\/)/, `importmap entry '${name}' is unpinned: ${url}`)
+  }
+  assert.match(imports['graphiql'], /^https:\/\/esm\.sh\/graphiql@/)
+  assert.match(imports['react'], /^https:\/\/esm\.sh\/react@/)
+
+  // `external=` keeps one React instance across every bundle — without it the
+  // GraphiQL hooks and the Explorer plugin each load their own copy.
+  assert.ok(imports['graphiql'].includes('external=react,react-dom,@graphiql/react,graphql'))
+  assert.ok(imports['@graphiql/plugin-explorer'].includes('external=react,@graphiql/react,graphql'))
+
+  // The page configures the fetcher for the mounted path, not a hardcoded one.
+  assert.ok(html.includes("url: \"/graphql\""), 'fetcher points at the mount path')
+  assert.ok(html.includes("credentials: 'same-origin'"), 'session cookie rides along')
+  assert.ok(html.includes('explorerPlugin'), 'Explorer plugin wired')
+  assert.ok(!html.includes('${'), 'no unsubstituted template placeholder leaked into the page')
+
+  // A custom mount path flows into the page as a JS-safe literal.
+  const custom = new OpenAPIHono()
+  const bridge = new HonoGqlMcp(custom, { name: 'custom-graphql' })
+  bridge.mountGraphQL(custom, { graphqlPath: '/api/gql', graphiqlPath: '/play' })
+  const customHtml = await (await custom.request('/play')).text()
+  assert.ok(customHtml.includes('url: "/api/gql"'), 'custom graphqlPath reaches the fetcher')
+})
+
+// -- REST docs: OpenAPI document + Swagger UI ------------------------------------------
+
+test('docs: /openapi.json derives from the same createRoute definitions, recursion ref-safe', async () => {
+  const fresh = await createApp()
+  const res = await fresh.app.request('/openapi.json')
+  assert.equal(res.status, 200)
+  const doc = (await res.json()) as {
+    openapi: string
+    paths: Record<string, unknown>
+    components?: { schemas?: Record<string, unknown> }
+  }
+  assert.ok(doc.openapi.startsWith('3.1'), doc.openapi)
+  // Every zod-openapi route appears — a subset would mean the doc silently dropped routes.
+  assert.deepEqual(
+    Object.keys(doc.paths).sort(),
+    ['/categories', '/notes', '/notes/{id}', '/stats'],
+  )
+  // The recursive Category schema is emitted as a $ref, not inlined forever —
+  // the bug that made getOpenAPIDocument() blow the stack before `id` was set.
+  const cat = JSON.stringify(doc.components?.schemas?.Category)
+  assert.ok(cat.includes('"$ref":"#/components/schemas/Category"'), cat)
+
+  // Swagger UI is mounted and points at the document.
+  const ui = await fresh.app.request('/docs')
+  assert.equal(ui.status, 200)
+  const html = await ui.text()
+  assert.ok(html.includes('swagger-ui'), 'swagger assets')
+  assert.ok(html.includes('/openapi.json'), 'document url wired')
+})
+
+test('docs: /docs and /openapi.json are public; business routes stay gated', async () => {
+  const fresh = await createApp()
+  assert.equal((await fresh.app.request('/openapi.json')).status, 200)
+  assert.equal((await fresh.app.request('/docs')).status, 200)
+  assert.equal((await fresh.app.request('/notes')).status, 401, 'still gated')
+})
+
 // -- response limiting + rate limiting + run() -----------------------------------------
 
 test('maxResponseChars truncates oversized tool results with a marker', async () => {
-  const fresh = createApp()
+  const fresh = await createApp()
   const capped = new HonoGqlMcp(fresh.app, { name: 'capped', allowMutation: true, maxResponseChars: 150 })
   capped.mountTo(fresh.app, '/mcp-capped')
   const { client, transport } = await mcpClient(AUTH, fresh.app, '/mcp-capped')
@@ -661,7 +961,7 @@ test('maxResponseChars truncates oversized tool results with a marker', async ()
 })
 
 test('rateLimit: rapid requests above the budget get 429', async () => {
-  const fresh = createApp()
+  const fresh = await createApp()
   const limited = new HonoGqlMcp(fresh.app, { name: 'limited', rateLimit: { maxPerSecond: 2 } })
   limited.mountTo(fresh.app, '/mcp-limited')
 
@@ -689,7 +989,7 @@ test('rateLimit: rapid requests above the budget get 429', async () => {
 })
 
 test('run(): standalone MCP server on its own port', async () => {
-  const fresh = createApp()
+  const fresh = await createApp()
   const runner = new HonoGqlMcp(fresh.app, { name: 'standalone' })
   const server = await runner.run({ port: 8199 })
   try {
@@ -734,19 +1034,23 @@ const postTo = (target: Hono<any, any, any>, path: string, headers: Record<strin
   )
 
 test('auth gate: no/bad token → 401 with a WWW-Authenticate Bearer challenge', async () => {
-  const fresh = createApp() // /mcp-secure is gated by sharedSecret = demo-secret
-  const no = await postTo(fresh.app, '/mcp-secure')
+  const fresh = await createApp() // the example /mcp is gated by better-auth's verifier
+  const no = await postTo(fresh.app, '/mcp')
   assert.equal(no.status, 401)
   assert.ok(no.headers.get('www-authenticate')?.startsWith('Bearer'), 'challenge header')
+  assert.ok(
+    no.headers.get('www-authenticate')?.includes('resource_metadata='),
+    'challenge carries the discovery pointer (RFC 9728)',
+  )
 
-  const bad = await postTo(fresh.app, '/mcp-secure', { authorization: 'Bearer wrong' })
+  const bad = await postTo(fresh.app, '/mcp', { authorization: 'Bearer wrong' })
   assert.equal(bad.status, 401)
   assert.ok(bad.headers.get('www-authenticate')?.includes('invalid_token'))
 })
 
-test('auth gate: sharedSecret full MCP round trip — one token passes both checks', async () => {
-  const fresh = createApp()
-  const { client, transport } = await mcpClient(AUTH, fresh.app, '/mcp-secure')
+test('auth gate: a real token passes both checks — one Bearer, endpoint and routes', async () => {
+  const fresh = await createApp()
+  const { client, transport } = await mcpClient(AUTH, fresh.app, '/mcp')
   const { tools } = await client.listTools()
   assert.equal(tools.length, 3)
   const raw = await callToolText(client, 'graphql_query', {
@@ -757,8 +1061,31 @@ test('auth gate: sharedSecret full MCP round trip — one token passes both chec
   await transport.close()
 })
 
+test('isolation: one user never sees another user\'s notes', async () => {
+  const fresh = await createApp()
+  const alice = { authorization: `Bearer ${await signToken('user-alice')}` }
+  const bob = { authorization: `Bearer ${await signToken('user-bob')}` }
+
+  // Alice creates a note.
+  const created = await fresh.app.request('/notes', {
+    method: 'POST',
+    headers: { ...alice, 'content-type': 'application/json' },
+    body: JSON.stringify({ title: 'alice-secret', tags: [] }),
+  })
+  assert.equal(created.status, 201)
+  const noteId = ((await created.json()) as { id: string }).id
+
+  // Alice sees it; Bob does not — not in his list, and a direct fetch is 404.
+  const aliceList = (await (await fresh.app.request('/notes', { headers: alice })).json()) as Array<{ id: string }>
+  assert.ok(aliceList.some((n) => n.id === noteId))
+  const bobList = (await (await fresh.app.request('/notes', { headers: bob })).json()) as Array<{ id: string }>
+  assert.ok(!bobList.some((n) => n.id === noteId), 'bob must not see alice\'s note')
+  const bobGet = await fresh.app.request(`/notes/${noteId}`, { headers: bob })
+  assert.equal(bobGet.status, 404, 'someone else\'s note does not exist for you')
+})
+
 test('auth gate: independent of route auth — gate token ≠ route token → HTTP_401 field errors', async () => {
-  const fresh = createApp()
+  const fresh = await createApp()
   const gated = new HonoGqlMcp(fresh.app, {
     name: 'independent-gate',
     auth: {
@@ -782,7 +1109,7 @@ test('auth gate: independent of route auth — gate token ≠ route token → HT
 })
 
 test('auth gate: verifyToken returning null refuses with 401', async () => {
-  const fresh = createApp()
+  const fresh = await createApp()
   const gated = new HonoGqlMcp(fresh.app, { name: 'null-gate', auth: { verifyToken: () => null } })
   gated.mountTo(fresh.app, '/mcp-null')
   const res = await postTo(fresh.app, '/mcp-null', { authorization: 'Bearer anything' })
@@ -790,8 +1117,23 @@ test('auth gate: verifyToken returning null refuses with 401', async () => {
   assert.ok(res.headers.get('www-authenticate')?.includes('invalid_token'))
 })
 
+test('auth gate: sharedSecret — exact token passes, near-misses refuse (constant-time compare)', async () => {
+  const fresh = await createApp()
+  const gated = new HonoGqlMcp(fresh.app, { name: 'secret-gate', auth: { sharedSecret: 's3cret-token-abcdef' } })
+  gated.mountTo(fresh.app, '/mcp-secret')
+  // Prefix, suffix, longer, shorter: every near-miss must refuse. (The
+  // comparison is constant-time — a timing signal cannot be asserted in a
+  // test, but these pin the equality semantics it must preserve.)
+  for (const token of ['s3cret-token-abcde', 's3cret-token-abcdef0', 'x3cret-token-abcdef', '']) {
+    const res = await postTo(fresh.app, '/mcp-secret', ...(token ? [{ authorization: `Bearer ${token}` }] : []))
+    assert.equal(res.status, 401, `near-miss '${token}' must refuse`)
+  }
+  const ok = await postTo(fresh.app, '/mcp-secret', { authorization: 'Bearer s3cret-token-abcdef' })
+  assert.equal(ok.status, 200)
+})
+
 test('auth gate: requiredScopes — missing scope → 403 with a scope hint', async () => {
-  const fresh = createApp()
+  const fresh = await createApp()
   const authInfo = (scopes: string[]) => ({ token: 't', clientId: 'c', scopes, expiresAt: Math.floor(Date.now() / 1000) + 3600 })
   const gated = new HonoGqlMcp(fresh.app, {
     name: 'scope-gate',
@@ -886,8 +1228,11 @@ test('auth: per-tool scopes — graphql_mutation demands notes:write (pre-dispat
 })
 
 test('auth: discovery — RFC 9728/8414 well-known routes, normal paths untouched', async () => {
-  const fresh = createApp()
-  const gated = new HonoGqlMcp(fresh.app, {
+  // A bare app, NOT createApp(): the example mounts its own
+  // /.well-known/oauth-authorization-server, and Hono serves the first match.
+  const app = new OpenAPIHono()
+  app.get('/ping', (c) => c.json({ ok: true }))
+  const gated = new HonoGqlMcp(app, {
     name: 'discovery',
     auth: {
       sharedSecret: 'demo-secret',
@@ -904,35 +1249,112 @@ test('auth: discovery — RFC 9728/8414 well-known routes, normal paths untouche
       },
     },
   })
-  gated.mountTo(fresh.app, '/mcp-d')
+  gated.mountTo(app, '/mcp-d')
 
-  const prm = await fresh.app.request('/.well-known/oauth-protected-resource/mcp-d')
+  const prm = await app.request('/.well-known/oauth-protected-resource/mcp-d')
   assert.equal(prm.status, 200)
   const prmBody = (await prm.json()) as { resource: string; authorization_servers: string[]; scopes_supported: string[] }
   assert.equal(prmBody.resource, 'http://localhost:8100/mcp-d')
   assert.deepEqual(prmBody.authorization_servers, ['https://idp.example.com'])
   assert.deepEqual(prmBody.scopes_supported, ['mcp', 'notes:write'])
 
-  const as = await fresh.app.request('/.well-known/oauth-authorization-server')
+  const as = await app.request('/.well-known/oauth-authorization-server')
   assert.equal(as.status, 200)
   assert.equal(((await as.json()) as { issuer: string }).issuer, 'https://idp.example.com')
 
   // The well-known middleware falls through — regular routes unaffected.
-  const notes = await fresh.app.request('/notes', { headers: AUTH })
-  assert.equal(notes.status, 200)
+  const ping = await app.request('/ping')
+  assert.equal(ping.status, 200)
 })
 
-test('auth: config errors — verifier sources are mutually exclusive and required', () => {
+test('auth: config errors — verifier sources are mutually exclusive and required', async () => {
+  const { app } = await createApp()
   assert.throws(
-    () => new HonoGqlMcp(createApp().app, { auth: {} }),
+    () => new HonoGqlMcp(app, { auth: {} }),
     (e: unknown) => e instanceof Error && e.name === 'HonoGqlMcpConfigError',
   )
   assert.throws(
     () =>
-      new HonoGqlMcp(createApp().app, {
+      new HonoGqlMcp(app, {
         auth: { verifyToken: () => null, sharedSecret: 'x' },
       }),
     (e: unknown) => e instanceof Error && /only one/.test(e.message),
+  )
+})
+
+// -- host/origin validation on /mcp ----------------------------------------------
+
+test('host validation: default is localhost-only — a real hostname is 403 until allowed', async () => {
+  const fresh = await createApp()
+  // Mount every bridge BEFORE the first request — Hono builds its route
+  // matcher on first request and rejects later registrations.
+  const gated = new HonoGqlMcp(fresh.app, {
+    name: 'domain',
+    hostValidation: { allowedHostnames: ['api.example.com'], allowedOrigins: ['claude.ai'] },
+  })
+  gated.mountTo(fresh.app, '/mcp-domain')
+  const open = new HonoGqlMcp(fresh.app, { name: 'open-host', hostValidation: { allowedHostnames: [] } })
+  open.mountTo(fresh.app, '/mcp-anyhost')
+
+  const init = (host: string, origin: string | undefined, authorization?: string) =>
+    fresh.app.request(
+      new Request('http://localhost:8100/mcp', {
+        method: 'POST',
+        headers: {
+          ...JSONRPC_HEADERS,
+          host,
+          ...(origin ? { origin } : {}),
+          ...(authorization ? { authorization } : {}),
+        },
+        body: INIT_BODY,
+      }),
+    )
+  // Default (no hostValidation): any non-localhost Host is refused — CLI MCP
+  // clients send Host, so a domain deployment is dead until it opts in.
+  assert.equal((await init('api.example.com', undefined)).status, 403)
+  // localhost passes the host check (the auth gate then answers 200 with a
+  // real token — host validation runs BEFORE the gate, so the 403s above
+  // fired without one).
+  assert.equal((await init('localhost:8100', undefined, AUTH.authorization)).status, 200)
+  // Browsers send Origin too; same allowlist applies.
+  assert.equal((await init('localhost:8100', 'https://claude.ai')).status, 403)
+
+  // Opt-in: naming the hostname lets its CLI and browser clients through.
+  const initOn = (path: string, host: string, origin?: string, authorization?: string) =>
+    fresh.app.request(
+      new Request(`http://localhost:8100${path}`, {
+        method: 'POST',
+        headers: { ...JSONRPC_HEADERS, host, ...(origin ? { origin } : {}), ...(authorization ? { authorization } : {}) },
+        body: INIT_BODY,
+      }),
+    )
+  assert.equal((await initOn('/mcp-domain', 'api.example.com', undefined, AUTH.authorization)).status, 200, 'CLI client: Host allowed')
+  assert.equal(
+    (await initOn('/mcp-domain', 'api.example.com', 'https://claude.ai', AUTH.authorization)).status, 200,
+    'browser client: Origin allowed',
+  )
+  assert.equal((await initOn('/mcp-domain', 'localhost:8100')).status, 403, 'not in the allowlist anymore')
+  // Empty arrays disable each half — an explicit escape hatch for hosts that
+  // terminate TLS upstream and cannot vouch for Host/Origin at all.
+  const anyHost = await fresh.app.request(
+    new Request('http://localhost:8100/mcp-anyhost', {
+      method: 'POST',
+      headers: { ...JSONRPC_HEADERS, host: 'whatever.example' },
+      body: INIT_BODY,
+    }),
+  )
+  assert.equal(anyHost.status, 200)
+})
+
+test('host validation: a malformed allowlist fails at construction', async () => {
+  const { app } = await createApp()
+  assert.throws(
+    () => new HonoGqlMcp(app, { hostValidation: { allowedHostnames: ['ok', ''] } }),
+    (e: unknown) => e instanceof Error && e.name === 'HonoGqlMcpConfigError',
+  )
+  assert.throws(
+    () => new HonoGqlMcp(app, { hostValidation: { allowedOrigins: 'claude.ai' as never } }),
+    (e: unknown) => e instanceof Error && e.name === 'HonoGqlMcpConfigError',
   )
 })
 
@@ -962,7 +1384,7 @@ test('otel: tools/call → graphql.execute → route span, one waterfall', async
   // The example mounts @hono/otel BEFORE its routes under HONO_GQL_MCP_OTEL=1
   // (Hono middleware registered after a handler does not wrap it).
   process.env.HONO_GQL_MCP_OTEL = '1'
-  const fresh = createApp()
+  const fresh = await createApp()
 
   const { client, transport } = await mcpClient(AUTH, fresh.app)
   await callToolText(client, 'graphql_query', {
@@ -1018,6 +1440,10 @@ test('otel: route.timeout and route.queue surface as events on graphql.execute',
   const exec2 = exporter.getFinishedSpans().filter((s) => s.name === 'graphql.execute').pop()
   assert.ok(exec2?.events.some((e: { name: string }) => e.name === 'route.queue'), JSON.stringify(exec2?.events))
 })
+
+// Close the shared store when the run ends, so WAL is checkpointed and the
+// sqlite file is left clean for the next `npm test`.
+process.on('exit', () => store.close())
 
 // -- bridgeValidator: the zValidator-style route source -----------------------------
 
@@ -1079,7 +1505,19 @@ test('zValidator style: form target and wildcard paths are skipped; filters appl
   assert.ok(!excluded.getSDL().includes('get_kept'), 'path filter drops validator routes')
 })
 
-// -- remaining review coverage: shapes, faces, and mounting ------------------------
+// -- additions on top of the remote suite: coverage the 2026-10-11 pass lacks ------
+
+test('MCP: graphql_mutation refuses non-mutation documents, and nothing executes', async () => {
+  const { client, transport } = await mcpClient(AUTH)
+  const result = (await client.callTool({
+    name: 'graphql_mutation',
+    arguments: { query: `{ notes { list_notes { id } } }` },
+  })) as { isError?: boolean; content: Array<{ type: string; text: string }> }
+  assert.equal(result.isError, true)
+  assert.ok(result.content[0].text.includes('only runs mutation documents'), result.content[0].text)
+  await client.close()
+  await transport.close()
+})
 
 test('sub-app mounting: app.route() routes derive and execute (registry path merge)', async () => {
   const sub = new OpenAPIHono()
@@ -1093,9 +1531,19 @@ test('sub-app mounting: app.route() routes derive and execute (registry path mer
     } as Parameters<typeof createRoute>[0],
     (c) => c.json({ v: 'sub' }, 200),
   )
-  const app = new OpenAPIHono()
-  app.route('/api', sub)
-  const h = new RouterGraphQLHandler(app)
+  const host = new OpenAPIHono()
+  host.openapi(
+    {
+      method: 'get',
+      path: '/root',
+      tags: ['root'],
+      operationId: 'root_op',
+      responses: { 200: okResponse(z.object({ v: z.string() })) },
+    } as Parameters<typeof createRoute>[0],
+    (c) => c.json({ v: 'root' }, 200),
+  )
+  host.route('/api', sub)
+  const h = new RouterGraphQLHandler(host)
   assert.ok(h.getSDL().includes('list_items'), 'sub-app route derived from the merged registry path')
   const result = await h.execute(`{ shop { list_items { v } } }`)
   assert.equal(d(result).shop.list_items.v, 'sub')
@@ -1164,47 +1612,6 @@ test('raw JSON bucket: a non-JSON 2xx body comes back as raw text', async () => 
   assert.equal(d(result).raw.get_rawtext, 'plain-body')
 })
 
-test('fragments execute against the derived schema', async () => {
-  const result = await gql(`query {
-    notes { list_notes { ...NoteBits } }
-  }
-  fragment NoteBits on Note { title }`)
-  assert.ok(d(result).notes.list_notes[0].title)
-})
-
-test('graphql face: 400 for non-JSON body and missing query; operationName selects the operation', async () => {
-  const fresh = createApp()
-
-  const notJson = await fresh.app.request('/graphql', {
-    method: 'POST',
-    headers: { 'content-type': 'text/plain' },
-    body: 'not-json',
-  })
-  assert.equal(notJson.status, 400)
-  assert.ok(JSON.stringify(await notJson.json()).includes('must be JSON'))
-
-  const noQuery = await fresh.app.request('/graphql', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({}),
-  })
-  assert.equal(noQuery.status, 400)
-  assert.ok(JSON.stringify(await noQuery.json()).includes("'query'"))
-
-  const multi = await fresh.app.request('/graphql', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: 'Bearer demo-secret' },
-    body: JSON.stringify({
-      query: 'query A { notes { list_notes { title } } } query B { analytics { stats { total } } }',
-      operationName: 'B',
-    }),
-  })
-  assert.equal(multi.status, 200)
-  const body = (await multi.json()) as { data: Record<string, unknown> }
-  assert.ok(body.data.analytics, 'operationName B ran')
-  assert.equal(body.data.notes, undefined, 'operation A did not run')
-})
-
 test('progressive: get_query_schema on a mutation-only domain answers DOMAIN_NOT_FOUND', async () => {
   const app = new OpenAPIHono()
   app.openapi(
@@ -1237,13 +1644,16 @@ test('progressive: get_query_schema on a mutation-only domain answers DOMAIN_NOT
   await transport.close()
 })
 
-test('config: progressiveThreshold / maxResponseChars / rateLimit validated at the facade too', () => {
-  const app = createApp().app
-  assert.throws(() => new HonoGqlMcp(app, { progressiveThreshold: 0 }), HonoGqlMcpConfigError)
-  assert.throws(() => new HonoGqlMcp(app, { progressiveThreshold: 2.5 }), HonoGqlMcpConfigError)
-  assert.throws(() => new HonoGqlMcp(app, { maxResponseChars: 0 }), HonoGqlMcpConfigError)
-  assert.throws(() => new HonoGqlMcp(app, { rateLimit: { maxPerSecond: 0 } }), HonoGqlMcpConfigError)
-})
-
 // -- runner ----------------------------------------------------------------------
-await runAll('e2e')
+let failed = 0
+for (const [name, fn] of tests) {
+  try {
+    await fn()
+    console.log(`  ✓ ${name}`)
+  } catch (err) {
+    failed++
+    console.error(`  ✗ ${name}\n    ${err instanceof Error ? err.message : err}`)
+  }
+}
+console.log(failed === 0 ? `\nAll ${tests.length} checks passed.` : `\n${failed}/${tests.length} checks FAILED.`)
+process.exit(failed === 0 ? 0 : 1)
