@@ -20,6 +20,7 @@ import { GraphQLError } from 'graphql'
 import type { RouteConfig } from '@asteasolutions/zod-to-openapi'
 import type { Hono } from 'hono'
 import { jsonBodySchemaOf } from './scanner.ts'
+import { activeSpan, injectTraceContext } from './otel.ts'
 
 export interface CallPlan {
   route: RouteConfig
@@ -84,12 +85,14 @@ function passthrough(incoming: IncomingHeaders, allow: string[]): Record<string,
 export class RouteExecutor {
   readonly #timeoutMs: number | null
   readonly #sem: Semaphore | undefined
+  readonly #app: Hono
+  readonly #passthroughHeaders: string[]
 
-  constructor(
-    private app: Hono,
-    private passthroughHeaders: string[],
-    hardening: ExecutorHardening,
-  ) {
+  constructor(app: Hono, passthroughHeaders: string[], hardening: ExecutorHardening) {
+    // Explicit assignment (no parameter properties) — Node's strip-only TS
+    // mode does not support them, and the runner is plain node.
+    this.#app = app
+    this.#passthroughHeaders = passthroughHeaders
     this.#timeoutMs = hardening.requestTimeoutMs
     this.#sem = hardening.maxConcurrency === null ? undefined : new Semaphore(hardening.maxConcurrency)
   }
@@ -111,7 +114,7 @@ export class RouteExecutor {
     }
     const url = query.size > 0 ? `${path}?${query}` : path
 
-    const headers = passthrough(incoming, this.passthroughHeaders)
+    const headers = passthrough(incoming, this.#passthroughHeaders)
     const init: RequestInit = { method, headers }
 
     const bodySchema = jsonBodySchemaOf(route)
@@ -119,16 +122,28 @@ export class RouteExecutor {
       init.body = JSON.stringify(args['body'] ?? {})
       headers['content-type'] = 'application/json'
     }
+    // W3C trace context rides alongside the caller's credentials (own channel,
+    // not the whitelist) so the host's route instrumentation nests under
+    // graphql.execute. No-op without a recording span.
+    injectTraceContext(headers)
 
     const label = `${method} ${route.path}`
+    const span = activeSpan()
     const run = async (signal: AbortSignal | undefined): Promise<Response> => {
+      const queuedAt = Date.now()
       const release = this.#sem ? await this.#sem.acquire() : undefined
       try {
+        const waitMs = release ? Date.now() - queuedAt : 0
+        if (release && waitMs > 0) {
+          // Queue waits surface as span events on graphql.execute.
+          span?.addEvent('route.queue', { 'route.queue.wait_ms': waitMs, 'route.call': label })
+        }
         // The queue wait counted against the deadline — nothing to run.
         if (signal?.aborted) {
+          span?.addEvent('route.timeout', { 'route.timeout.ms': this.#timeoutMs ?? 0, 'route.call': label, 'route.queued': true })
           throw new GraphQLError(`TIMEOUT: ${label} exceeded ${this.#timeoutMs}ms (while queued)`)
         }
-        return await this.app.request(url, init)
+        return await this.#app.request(url, init)
       } finally {
         release?.()
       }
@@ -141,7 +156,10 @@ export class RouteExecutor {
     const deadline = new Promise<never>((_, reject) => {
       controller.signal.addEventListener(
         'abort',
-        () => reject(new GraphQLError(`TIMEOUT: ${label} exceeded ${this.#timeoutMs}ms`)),
+        () => {
+          span?.addEvent('route.timeout', { 'route.timeout.ms': this.#timeoutMs ?? 0, 'route.call': label })
+          reject(new GraphQLError(`TIMEOUT: ${label} exceeded ${this.#timeoutMs}ms`))
+        },
         { once: true },
       )
     })

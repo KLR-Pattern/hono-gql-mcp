@@ -39,6 +39,7 @@ import {
 import { RouteExecutor } from './executor.ts'
 import { LruCache } from './lru.ts'
 import type { DomainRegistry } from './domains.ts'
+import { withExecuteSpan } from './otel.ts'
 
 export interface HandlerOptions extends ScanFilters {
   allowMutation?: boolean
@@ -181,7 +182,9 @@ export class RouterGraphQLHandler {
    * Execute a GraphQL document against the bridged schema. `headers` are the
    * caller's own credentials — they travel to every route call through the
    * passthrough whitelist. The parse+depth+validate front half is cached by
-   * query string; execution results are not.
+   * query string; execution results are not. Execution runs inside a
+   * `graphql.execute` span (OTel): resolvers and their route calls nest
+   * under it — no-op without a registered OTel SDK.
    */
   async execute(
     query: string,
@@ -204,12 +207,19 @@ export class RouterGraphQLHandler {
       this.#cache.set(query, front)
     }
     if (front.errors.length > 0) return { errors: front.errors }
-    return execute({
-      schema: this.schema,
-      document: front.document,
-      variableValues: variables,
-      operationName: options?.operationName,
-      contextValue: { headers: options?.headers },
+    const operation =
+      front.document.definitions.find((def) => def.kind === 'OperationDefinition')?.operation ?? 'unknown'
+    return withExecuteSpan(async (span) => {
+      span.setAttribute('graphql.operation', operation)
+      const result = await execute({
+        schema: this.schema,
+        document: front.document,
+        variableValues: variables,
+        operationName: options?.operationName,
+        contextValue: { headers: options?.headers },
+      })
+      if (result.errors?.length) span.setAttribute('graphql.errors', result.errors.length)
+      return result
     })
   }
 }

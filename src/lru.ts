@@ -4,8 +4,12 @@
  */
 export class LruCache<T> {
   #map = new Map<string, T>()
+  readonly capacity: number
 
-  constructor(readonly capacity: number) {}
+  constructor(capacity: number) {
+    // Explicit field (no parameter property) — Node strip-only TS mode.
+    this.capacity = capacity
+  }
 
   get size(): number {
     return this.#map.size

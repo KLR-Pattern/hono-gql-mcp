@@ -9,6 +9,7 @@
 import { serve } from '@hono/node-server'
 import { pathToFileURL } from 'node:url'
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
+import { httpInstrumentationMiddleware } from '@hono/otel'
 import { HonoGqlMcp } from '../src/index.ts'
 
 // ---- domain models — .meta({ title }) names the GraphQL type ----------------
@@ -125,6 +126,14 @@ const categories = createRoute({
 
 export function createApp() {
   const app = new OpenAPIHono()
+
+  // Optional route-level tracing (HONO_GQL_MCP_OTEL=1): @hono/otel extracts the
+  // W3C traceparent the bridge injects into every in-process route call, so
+  // route spans nest under graphql.execute. Without a registered OTel SDK both
+  // sides are no-ops — see the README's Observability section.
+  if (process.env.HONO_GQL_MCP_OTEL === '1') {
+    app.use(httpInstrumentationMiddleware({ serviceName: 'notes-api' }) as never)
+  }
 
   // ---- in-memory store (fresh per app instance) ------------------------------
   let nextId = 4

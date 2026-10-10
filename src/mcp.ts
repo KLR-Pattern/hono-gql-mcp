@@ -31,6 +31,7 @@ import { GraphQLError, GraphQLNonNull, GraphQLObjectType, GraphQLSchema, parse, 
 import type { RouterGraphQLHandler } from './handler.ts'
 import { groupTypeName } from './schema-builder.ts'
 import type { ResolvedAuth } from './auth.ts'
+import { withToolSpan, type EnvelopeTrace } from './otel.ts'
 
 export type ToolMode = 'auto' | 'simple' | 'progressive'
 /** After mode resolution: which toolset is actually registered. */
@@ -178,6 +179,25 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
     // the GraphQL context — resolvers forward them through the whitelist.
     const callerHeaders = ctx.requestInfo?.headers
     const server = new McpServer({ name: opts.name, version: opts.version }, { instructions: opts.instructions })
+
+    // Uniform tool registration: every tool runs inside a `tools/call <name>`
+    // span, parented to the CALLER's trace when the envelope carried one
+    // (2026-07-28 _meta traceparent). The SDK calls no-input tools as
+    // handler(ctx) and input tools as handler(args, ctx) — normalize first.
+    // `any` here keeps the call-site callbacks' destructuring typed.
+    const register = (name: string, config: unknown, cb: (args: any, ctx: any) => unknown): void => {
+      server.registerTool(
+        name,
+        config as never,
+        ((a: unknown, b: unknown) => {
+          const [args, ctx] =
+            b === undefined && (a as { mcpReq?: unknown })?.mcpReq !== undefined ? [undefined, a] : [a, b]
+          return withToolSpan(name, (ctx as { mcpReq?: { envelope?: EnvelopeTrace } })?.mcpReq?.envelope, async () =>
+            (await (cb as (args: unknown, ctx: unknown) => unknown)(args, ctx)) as never,
+          )
+        }) as never,
+      )
+    }
     const cap = opts.maxResponseChars
     const text = (payload: unknown) => limitText(JSON.stringify(payload, null, 2), cap)
 
@@ -193,7 +213,7 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
       handler.execute(query, variables, { headers: callerHeaders })
 
     if (opts.mode === 'simple') {
-      server.registerTool(
+      register(
         'get_schema',
         {
           title: 'Get the GraphQL schema',
@@ -214,7 +234,7 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
         return handler.registry.has(path) ? path : null
       }
 
-      server.registerTool(
+      register(
         'list_domains',
         {
           title: 'List domains',
@@ -230,7 +250,7 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
         }),
       )
 
-      server.registerTool(
+      register(
         'list_queries',
         {
           title: "List a domain's Query operations",
@@ -268,7 +288,7 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
       )
 
       if (opts.allowMutation) {
-        server.registerTool(
+        register(
           'list_mutations',
           {
             title: "List a domain's Mutation operations",
@@ -292,7 +312,7 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
         )
       }
 
-      server.registerTool(
+      register(
         'get_query_schema',
         {
           title: "Get a domain's SDL fragment",
@@ -355,7 +375,7 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
       variables: z.record(z.string(), z.unknown()).optional().describe('Query variables, if the document declares any'),
     })
 
-    server.registerTool(
+    register(
       'graphql_query',
       {
         title: 'Run a GraphQL query',
@@ -376,7 +396,7 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
     )
 
     if (opts.allowMutation) {
-      server.registerTool(
+      register(
         'graphql_mutation',
         {
           title: 'Run a GraphQL mutation',
@@ -419,8 +439,12 @@ function hashKey(s: string): string {
 
 class FixedWindowLimiter {
   #counts = new Map<string, { window: number; count: number }>()
+  readonly max: number
 
-  constructor(readonly max: number) {}
+  constructor(max: number) {
+    // Explicit field (no parameter property) — Node strip-only TS mode.
+    this.max = max
+  }
 
   allow(key: string): boolean {
     const now = Math.floor(Date.now() / 1000)

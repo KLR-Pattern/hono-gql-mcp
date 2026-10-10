@@ -255,9 +255,47 @@ otherwise make the SDK's challenge objects fail the check and let
 unauthenticated requests through (found the hard way; there is a regression
 test).
 
+## Observability (OpenTelemetry)
+
+One waterfall per query — install an OTel SDK next to your app and that is
+the whole setup (`@opentelemetry/api` is a direct dependency; without a
+registered SDK every span here is a no-op):
+
+```
+POST /mcp                       (HTTP entry — the host's @hono/otel middleware)
+└─ tools/call graphql_query     (tool layer — we emit)
+   └─ graphql.execute           (orchestration — we emit; route.timeout / route.queue surface as span events)
+      └─ GET /notes             (route layer — @hono/otel extracts the W3C traceparent
+                                  we inject into every in-process route call)
+```
+
+For route spans, mount `@hono/otel`'s `httpInstrumentationMiddleware`
+**before your routes** (Hono middleware registered after a handler does not
+wrap it) — the example does this under `HONO_GQL_MCP_OTEL=1`:
+
+```bash
+HONO_GQL_MCP_OTEL=1 npm run example   # route spans nest under graphql.execute
+```
+
+**Bonus over the Python bridge**: the MCP protocol (2026-07-28) carries the
+client's W3C trace context in the envelope `_meta` (`traceparent`). When an
+agent client propagates it, the tool span parents to the CALLER's trace —
+end to end from the agent client through GraphQL orchestration down to the
+business routes.
+
+Two implementation notes (both regression-tested):
+- Spans are wired manually (`startSpan` + `context.with` on our own api
+  import), not via `tracer.startActiveSpan` — the api package's exports map
+  can load two instances depending on the resolver, and the SDK-internal
+  `context.with` may land on the one whose context manager is never
+  registered, silently breaking nesting.
+- The W3C propagator is a pinned own instance — the api's GLOBAL propagator
+  stays a no-op until the host registers one, and extraction/injection must
+  not depend on that.
+
 ## Verified (PoC, 2026-10-10)
 
-`npm test` — 44 end-to-end checks, all passing:
+`npm test` — 47 end-to-end checks, all passing (plain `node`, type-stripping mode):
 
 - composition across 3 domains (nested tag included); field selection;
   partial failure (a 404 route nulls only itself, siblings survive)
@@ -294,6 +332,10 @@ test).
   design, normal paths untouched); config errors (verifier sources are
   mutually exclusive); and the `instanceof Response` realm regression
   (`run()` + gate in one process)
+- OTel: the four-layer waterfall (HTTP → tools/call → graphql.execute →
+  route span, one traceId) with a real in-memory exporter + AsyncHooks
+  context manager; envelope traceparent joining the CALLER's trace;
+  route.timeout / route.queue as span events on graphql.execute
 - plus a real-socket smoke test: REST 401/200, MCP initialize → tools/list →
   tools/call with and without credentials, `/graphql` + `/graphiql`
 
@@ -302,7 +344,6 @@ Stack: hono 4.13 · @hono/zod-openapi 1.6 (Zod v4 only) · graphql-js 17 ·
 
 ## Not in the PoC (the Python original has them)
 
-- OpenTelemetry spans (`graphql.execute` + W3C traceparent injection)
 - zValidator-style routes (schema is closure-private — needs a thin
   Symbol-attachment wrapper, ~50 lines, rhinobase/hono-openapi precedent)
 - sub-app mounting (`app.route()` + `basePath()`): registry path merging was
@@ -317,7 +358,12 @@ Stack: hono 4.13 · @hono/zod-openapi 1.6 (Zod v4 only) · graphql-js 17 ·
 
 ```bash
 npm install
-npm test          # 44 e2e checks
+npm test          # 47 e2e checks (plain node — type stripping, no bundler)
 npm run example   # notes demo on :8100 — REST + /mcp + /mcp-secure (gated) + /graphql + /graphiql
+HONO_GQL_MCP_OTEL=1 npm run example   # + route spans under graphql.execute
 npm run typecheck
 ```
+
+The runner is plain `node` (Node ≥ 22.18 strips types natively), not tsx —
+a bundler-style resolver loads two `@opentelemetry/api` instances from its
+exports map and silently breaks span nesting (see the Observability notes).

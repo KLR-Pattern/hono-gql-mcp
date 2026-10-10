@@ -898,6 +898,89 @@ test('auth: config errors — verifier sources are mutually exclusive and requir
   )
 })
 
+// -- OpenTelemetry: one waterfall per query ---------------------------------------
+
+/** Lazily register a real tracer provider + AsyncHooks context manager + in-memory exporter (memoized — one per process). */
+let otelExporter: { getFinishedSpans: () => Array<any> } | undefined
+async function otelSetup(): Promise<{ exporter: { getFinishedSpans: () => Array<any> } }> {
+  if (otelExporter) return { exporter: otelExporter }
+  const api = await import('@opentelemetry/api')
+  const { BasicTracerProvider, InMemorySpanExporter, SimpleSpanProcessor } = await import('@opentelemetry/sdk-trace-base')
+  const { AsyncHooksContextManager } = await import('@opentelemetry/context-async-hooks')
+  const exporter = new InMemorySpanExporter()
+  const provider = new BasicTracerProvider({ spanProcessors: [new SimpleSpanProcessor(exporter)] })
+  api.trace.setGlobalTracerProvider(provider)
+  api.context.setGlobalContextManager(new AsyncHooksContextManager().enable())
+  otelExporter = exporter
+  return { exporter }
+}
+
+// OTel JS 2.x spans carry the parent as a SpanContext object, not a parentSpanId field.
+const parentSpanIdOf = (span: any): string | undefined => span?.parentSpanContext?.spanId
+
+test('otel: tools/call → graphql.execute → route span, one waterfall', async () => {
+  const { exporter } = await otelSetup()
+
+  // The example mounts @hono/otel BEFORE its routes under HONO_GQL_MCP_OTEL=1
+  // (Hono middleware registered after a handler does not wrap it).
+  process.env.HONO_GQL_MCP_OTEL = '1'
+  const fresh = createApp()
+
+  const { client, transport } = await mcpClient(AUTH, fresh.app)
+  await callToolText(client, 'graphql_query', {
+    query: `{ notes { list_notes { title } } }`,
+  })
+  await client.close()
+  await transport.close()
+
+  const spans = exporter.getFinishedSpans()
+  const tool = spans.find((s) => s.name === 'tools/call graphql_query')
+  const exec = spans.find((s) => s.name === 'graphql.execute')
+  assert.ok(tool, `tool span missing in: ${spans.map((s) => s.name).join(', ')}`)
+  assert.ok(exec, 'graphql.execute span missing')
+
+  // graphql.execute nests under the tool span (AsyncHooks context).
+  assert.equal(parentSpanIdOf(exec), tool.spanContext().spanId)
+  // The route span (from @hono/otel) nests under graphql.execute via the
+  // injected W3C traceparent — the whole waterfall in one trace.
+  const routeChildren = spans.filter((s) => parentSpanIdOf(s) === exec.spanContext().spanId)
+  assert.ok(routeChildren.length >= 1, `no route span under graphql.execute in: ${spans.map((s) => s.name).join(', ')}`)
+  assert.equal(exec.spanContext().traceId, tool.spanContext().traceId)
+  assert.equal(routeChildren[0].spanContext().traceId, tool.spanContext().traceId)
+})
+
+test('otel: envelope traceparent parents the tool span to the caller trace', async () => {
+  const { exporter } = await otelSetup()
+  const { withToolSpan } = await import('../src/otel.ts')
+
+  // A foreign caller's trace context, as the 2026-07-28 envelope would carry it.
+  const traceId = '0af7651916cd43dd8448eb211c80319c'
+  const callerSpanId = 'b7ad6b7169203331'
+  const result = await withToolSpan('probe_tool', { traceparent: `00-${traceId}-${callerSpanId}-01` }, async () => 42)
+  assert.equal(result, 42)
+
+  const span = exporter.getFinishedSpans().find((s) => s.name === 'tools/call probe_tool')
+  assert.ok(span, 'probe span missing')
+  assert.equal(span.spanContext().traceId, traceId, 'span joins the CALLER trace')
+  assert.equal(parentSpanIdOf(span), callerSpanId, 'span parents to the caller span')
+})
+
+test('otel: route.timeout and route.queue surface as events on graphql.execute', async () => {
+  const { exporter } = await otelSetup()
+
+  const { app: timeoutApp } = slowApp()
+  const timedOut = new RouterGraphQLHandler(timeoutApp, { requestTimeoutMs: 50 })
+  await timedOut.execute(`{ bench { slow(ms: 300) { slept } } }`)
+  const exec1 = exporter.getFinishedSpans().filter((s) => s.name === 'graphql.execute').pop()
+  assert.ok(exec1?.events.some((e: { name: string }) => e.name === 'route.timeout'), JSON.stringify(exec1?.events))
+
+  const { app: queueApp } = slowApp()
+  const queued = new RouterGraphQLHandler(queueApp, { requestTimeoutMs: null, maxConcurrency: 1 })
+  await queued.execute(`{ bench { a: slow(ms: 60) { slept } b: slow(ms: 60) { slept } } }`)
+  const exec2 = exporter.getFinishedSpans().filter((s) => s.name === 'graphql.execute').pop()
+  assert.ok(exec2?.events.some((e: { name: string }) => e.name === 'route.queue'), JSON.stringify(exec2?.events))
+})
+
 // -- runner ----------------------------------------------------------------------
 let failed = 0
 for (const [name, fn] of tests) {
