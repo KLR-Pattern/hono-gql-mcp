@@ -21,6 +21,8 @@ import {
   hostHeaderValidationResponse,
   originValidationResponse,
   McpServer,
+  oauthMetadataResponse,
+  requireScopes,
   type McpHttpHandler,
 } from '@modelcontextprotocol/server'
 import type { Hono } from 'hono'
@@ -28,6 +30,7 @@ import { z } from 'zod'
 import { GraphQLError, GraphQLNonNull, GraphQLObjectType, GraphQLSchema, parse, printSchema, type GraphQLFieldConfig, type GraphQLObjectType as ObjType, type GraphQLType } from 'graphql'
 import type { RouterGraphQLHandler } from './handler.ts'
 import { groupTypeName } from './schema-builder.ts'
+import type { ResolvedAuth } from './auth.ts'
 
 export type ToolMode = 'auto' | 'simple' | 'progressive'
 /** After mode resolution: which toolset is actually registered. */
@@ -44,6 +47,8 @@ export interface McpFaceOptions {
   mode: ResolvedMode
   /** Truncation bound on tool result text (default 1_000_000). */
   maxResponseChars: number
+  /** Per-tool scope requirements (auth.toolScopes) — attached as SDK scope challenges, enforced pre-dispatch with HTTP 403. */
+  toolScopes?: Record<string, string[]>
 }
 
 function operationTypeOf(query: string): 'query' | 'mutation' | 'subscription' | null {
@@ -176,6 +181,14 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
     const cap = opts.maxResponseChars
     const text = (payload: unknown) => limitText(JSON.stringify(payload, null, 2), cap)
 
+    // Per-tool scope challenges: the SDK enforces them before dispatch (HTTP
+    // 403 + WWW-Authenticate insufficient_scope), against the authInfo the
+    // endpoint gate verified for this request.
+    const scopeFor = (name: string) => {
+      const scopes = opts.toolScopes?.[name]
+      return scopes && scopes.length > 0 ? { scopeChallenge: requireScopes(...(scopes as [string, ...string[]])) } : {}
+    }
+
     const runDocument = (query: string, variables: Record<string, unknown> | undefined) =>
       handler.execute(query, variables, { headers: callerHeaders })
 
@@ -188,6 +201,7 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
             'The full GraphQL SDL of this service. Routes are grouped into domains by tag. ' +
             'Read this once, then compose any routes in a single graphql_query.',
           annotations: { readOnlyHint: true },
+          ...scopeFor('get_schema'),
         },
         async () => ({ content: [{ type: 'text', text: text(handler.getSDL()) }] }),
       )
@@ -209,6 +223,7 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
             "tag 'billing:invoice' yields domain 'billing' with subdomain 'invoice'. Untagged routes group by " +
             "their first path segment. Start here, then drill in with list_queries(domain).",
           annotations: { readOnlyHint: true },
+          ...scopeFor('list_domains'),
         },
         async () => ({
           content: [{ type: 'text', text: text(ok({ domains: handler.registry.summary() }, 'Call list_queries(domain) with one of these domain paths.')) }],
@@ -226,6 +241,7 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
             domain: z.string().describe("Domain path from list_domains, e.g. 'billing:invoice'."),
           }),
           annotations: { readOnlyHint: true },
+          ...scopeFor('list_queries'),
         },
         async ({ domain }) => {
           const path = resolve(domain)
@@ -261,6 +277,7 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
               domain: z.string().describe("Domain path from list_domains, e.g. 'billing'."),
             }),
             annotations: { readOnlyHint: true },
+          ...scopeFor('list_mutations'),
           },
           async ({ domain }) => {
             const path = resolve(domain)
@@ -287,6 +304,7 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
             domain: z.string().describe("Domain path from list_domains, e.g. 'billing:invoice'."),
           }),
           annotations: { readOnlyHint: true },
+          ...scopeFor('get_query_schema'),
         },
         async ({ domain }) => {
           const path = resolve(domain)
@@ -346,6 +364,7 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
           'nulls only its own field while siblings survive. Select only the fields you need.',
         inputSchema: queryInput,
         annotations: { readOnlyHint: true },
+          ...scopeFor('graphql_query'),
       },
       async ({ query, variables }) => {
         if (operationTypeOf(query) !== 'query') {
@@ -368,6 +387,7 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
             variables: z.record(z.string(), z.unknown()).optional(),
           }),
           annotations: { destructiveHint: true },
+          ...scopeFor('graphql_mutation'),
         },
         async ({ query, variables }) => {
           if (operationTypeOf(query) !== 'mutation') {
@@ -421,12 +441,20 @@ class FixedWindowLimiter {
   }
 }
 
-/** Mount the MCP endpoint on a Hono app, with the SDK's localhost host/origin validation in front. */
+/**
+ * Mount the MCP endpoint on a Hono app. Enforcement order:
+ * rate limit → host/origin validation → auth gate → handler.fetch.
+ * The gate's verified AuthInfo rides into the handler (factory ctx and
+ * per-tool scope challenges read it). With `auth.discovery`, the two
+ * RFC 9728/8414 well-known routes are mounted too — host routes registered
+ * earlier win, per Hono's first-match rule.
+ */
 export function mountMcp(
   app: Hono<any, any, any>,
   httpHandler: McpHttpHandler,
   path = '/mcp',
   rateLimit?: RateLimitOptions,
+  auth?: ResolvedAuth,
 ): void {
   const limiter = rateLimit ? new FixedWindowLimiter(rateLimit.maxPerSecond) : undefined
   const serve = (c: { req: { raw: Request } }) => {
@@ -444,9 +472,29 @@ export function mountMcp(
     const rejected =
       hostHeaderValidationResponse(c.req.raw, localhostAllowedHostnames()) ??
       originValidationResponse(c.req.raw, localhostAllowedOrigins())
-    return rejected ?? httpHandler.fetch(c.req.raw)
+    if (rejected) return Promise.resolve(rejected)
+    if (!auth) return httpHandler.fetch(c.req.raw)
+    // One token, two checks: the gate verifies the ENDPOINT; the routes'
+    // own security schemes verify BUSINESS CALLS via per-caller passthrough.
+    return auth.gate(c.req.raw).then((verdict) =>
+      verdict.ok ? httpHandler.fetch(c.req.raw, { authInfo: verdict.authInfo }) : verdict.challenge,
+    )
   }
   const base = path.replace(/\/+$/, '') || '/mcp'
   app.all(base, serve as never)
   app.all(`${base}/*`, serve as never)
+
+  if (auth?.discovery) {
+    const discoveryOptions = auth.discovery
+    // oauthMetadataResponse returns undefined for non-well-known paths —
+    // middleware form short-circuits on a match, falls through otherwise.
+    app.get(
+      '/.well-known/*',
+      async (c: { req: { raw: Request } }, next: () => Promise<void>) => {
+        const doc = oauthMetadataResponse(c.req.raw, discoveryOptions)
+        if (doc) return doc
+        await next()
+      },
+    ) as never
+  }
 }

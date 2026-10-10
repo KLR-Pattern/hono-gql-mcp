@@ -151,6 +151,7 @@ new HonoGqlMcp(app, {
   documentCacheSize: 128,
   maxResponseChars: 1_000_000,        // tool result truncation bound
   rateLimit: { maxPerSecond: 10 },    // optional, per-process, keyed by hashed authorization
+  auth: { … },                        // gate the MCP endpoint — see Authentication
 })
 ```
 
@@ -194,9 +195,69 @@ degradedFields }` — the same classifier the startup notices come from, so the
 report and the warnings can never drift apart. `assert report.ready` in CI
 pins the exposure you expect.
 
+## Authentication
+
+The MCP endpoint gate, on SDK (`@modelcontextprotocol/server` 2.x) Protected
+Resource primitives. Enforcement order: rate limit → host/origin validation
+→ **auth gate** → handler.
+
+```ts
+const mcp = new HonoGqlMcp(app, {
+  name: 'my-app',
+  allowMutation: true,
+  auth: {
+    // exactly one verifier source (three styles, see below)
+    sharedSecret: 'one-shared-token',
+    // verifyToken: (token) => (token === ok ? { token, clientId, scopes, expiresAt } : null),
+    // verifier: myOAuthTokenVerifier,          // SDK escape hatch
+    requiredScopes: ['mcp'],                    // endpoint-level (403 insufficient_scope)
+    toolScopes: { graphql_mutation: ['notes:write'] },  // per-tool, pre-dispatch 403
+    resourceMetadataUrl: 'https://api.example.com/.well-known/oauth-protected-resource/mcp',
+    discovery: {                                // optional: mount the RFC 9728/8414 routes
+      resourceServerUrl: 'https://api.example.com/mcp',
+      authorizationServerMetadata: idpMetadata, // copied from your IdP, served verbatim
+      scopesSupported: ['mcp', 'notes:write'],
+    },
+  },
+})
+```
+
+- **Verifier sources** (exactly one; anything else throws
+  `HonoGqlMcpConfigError`): `sharedSecret` (one token, no OAuth machinery —
+  mints a rolling 1h AuthInfo), `verifyToken` (return the AuthInfo or null →
+  401; populate `expiresAt` — epoch seconds — or the gate rejects the token;
+  throw `OAuthError` for precise control), or `verifier` (a full SDK
+  `OAuthTokenVerifier`).
+- **One token, two checks**: the gate verifies the ENDPOINT; the routes' own
+  security schemes verify BUSINESS CALLS via per-caller passthrough. The two
+  may share a Bearer or not.
+- **Scopes**: `requiredScopes` applies at the gate (403 with a
+  `WWW-Authenticate: Bearer ... insufficient_scope` challenge);
+  `toolScopes` attaches SDK scope challenges to individual tools — enforced
+  **before dispatch** (HTTP 403, not an in-band tool error), so writes can
+  demand higher privilege than reads.
+- **Discovery**: with `auth.discovery`, `/.well-known/oauth-protected-resource[/path]`
+  (RFC 9728, path-aware) and `/.well-known/oauth-authorization-server`
+  (RFC 8414, your AS metadata verbatim) are mounted on the host app — public
+  by design: clients discover BEFORE authenticating. Host routes registered
+  earlier win, per Hono's first-match rule.
+- **What the SDK gives vs what you bring**: this is the Resource Server side
+  only — Bearer verification, RFC 6750 challenges, RFC 9728 discovery,
+  RFC 8707 audience checks (`expectedResource`). A complete Authorization
+  Server (DCR / authorize / token / consent) is not included: point
+  `discovery.authorizationServerMetadata` at your real IdP, or put one in
+  front.
+
+One implementation note: the gate's verdict is discriminated **by shape**
+(`status` + `headers`), not `instanceof Response` — hosts like
+`@hono/node-server` replace `globalThis.Response` at runtime, which would
+otherwise make the SDK's challenge objects fail the check and let
+unauthenticated requests through (found the hard way; there is a regression
+test).
+
 ## Verified (PoC, 2026-10-10)
 
-`npm test` — 36 end-to-end checks, all passing:
+`npm test` — 44 end-to-end checks, all passing:
 
 - composition across 3 domains (nested tag included); field selection;
   partial failure (a 404 route nulls only itself, siblings survive)
@@ -225,6 +286,14 @@ pins the exposure you expect.
 - `/graphql` face (POST with credentials, 405 usage, partial-failure 200) and
   GraphiQL; `maxResponseChars` truncation marker; `rateLimit` 429; `run()`
   standalone server on a real port
+- auth: the gate's 401 `WWW-Authenticate` challenge (no/bad/null token);
+  sharedSecret full MCP round trip; gate-vs-route independence (gate token ≠
+  route token → `HTTP_401` field errors); `requiredScopes` 403 with scope
+  hint; per-tool scopes — `graphql_mutation` refused pre-dispatch 403 without
+  the write scope, runs with it; RFC 9728/8414 discovery routes (public by
+  design, normal paths untouched); config errors (verifier sources are
+  mutually exclusive); and the `instanceof Response` realm regression
+  (`run()` + gate in one process)
 - plus a real-socket smoke test: REST 401/200, MCP initialize → tools/list →
   tools/call with and without credentials, `/graphql` + `/graphiql`
 
@@ -233,7 +302,6 @@ Stack: hono 4.13 · @hono/zod-openapi 1.6 (Zod v4 only) · graphql-js 17 ·
 
 ## Not in the PoC (the Python original has them)
 
-- OAuth on the MCP endpoint (a token-gate + OAuth 2.1 providers)
 - OpenTelemetry spans (`graphql.execute` + W3C traceparent injection)
 - zValidator-style routes (schema is closure-private — needs a thin
   Symbol-attachment wrapper, ~50 lines, rhinobase/hono-openapi precedent)
@@ -241,12 +309,15 @@ Stack: hono 4.13 · @hono/zod-openapi 1.6 (Zod v4 only) · graphql-js 17 ·
   verified in isolation during research; not covered by this test suite
 - benchmark comparison against fastmcp-TS `fromOpenAPI` / ClawQL (the Python
   repo's comparison/ methodology ports directly)
+- ready-made IdP adapters (Python fastmcp ships GitHub/Google/Auth0/Keycloak
+  providers; the TS SDK is Resource-Server-side only — bring your own IdP
+  and wire it through `verifyToken`/`verifier`)
 
 ## Dev
 
 ```bash
 npm install
-npm test          # 36 e2e checks
-npm run example   # notes demo on :8100 — REST + /mcp + /graphql + /graphiql
+npm test          # 44 e2e checks
+npm run example   # notes demo on :8100 — REST + /mcp + /mcp-secure (gated) + /graphql + /graphiql
 npm run typecheck
 ```

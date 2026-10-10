@@ -673,6 +673,231 @@ test('run(): standalone MCP server on its own port', async () => {
   }
 })
 
+// -- auth: the endpoint gate, scopes, discovery (Group 5) ----------------------------
+
+const JSONRPC_HEADERS = {
+  'content-type': 'application/json',
+  accept: 'application/json, text/event-stream',
+  host: 'localhost:8100',
+}
+const INIT_BODY = JSON.stringify({
+  jsonrpc: '2.0',
+  id: 1,
+  method: 'initialize',
+  params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'e2e', version: '1.0.0' } },
+})
+const postTo = (target: Hono<any, any, any>, path: string, headers: Record<string, string> = {}) =>
+  target.request(
+    new Request(`http://localhost:8100${path}`, {
+      method: 'POST',
+      headers: { ...JSONRPC_HEADERS, ...headers },
+      body: INIT_BODY,
+    }),
+  )
+
+test('auth gate: no/bad token → 401 with a WWW-Authenticate Bearer challenge', async () => {
+  const fresh = createApp() // /mcp-secure is gated by sharedSecret = demo-secret
+  const no = await postTo(fresh.app, '/mcp-secure')
+  assert.equal(no.status, 401)
+  assert.ok(no.headers.get('www-authenticate')?.startsWith('Bearer'), 'challenge header')
+
+  const bad = await postTo(fresh.app, '/mcp-secure', { authorization: 'Bearer wrong' })
+  assert.equal(bad.status, 401)
+  assert.ok(bad.headers.get('www-authenticate')?.includes('invalid_token'))
+})
+
+test('auth gate: sharedSecret full MCP round trip — one token passes both checks', async () => {
+  const fresh = createApp()
+  const { client, transport } = await mcpClient(AUTH, fresh.app, '/mcp-secure')
+  const { tools } = await client.listTools()
+  assert.equal(tools.length, 3)
+  const raw = await callToolText(client, 'graphql_query', {
+    query: `{ notes { list_notes { title } } }`,
+  })
+  assert.ok(JSON.parse(raw).data.notes.list_notes.length >= 1)
+  await client.close()
+  await transport.close()
+})
+
+test('auth gate: independent of route auth — gate token ≠ route token → HTTP_401 field errors', async () => {
+  const fresh = createApp()
+  const gated = new HonoGqlMcp(fresh.app, {
+    name: 'independent-gate',
+    auth: {
+      verifyToken: (token) =>
+        token === 'gate-token'
+          ? { token, clientId: 'gate', scopes: [], expiresAt: Math.floor(Date.now() / 1000) + 3600 }
+          : null,
+    },
+  })
+  gated.mountTo(fresh.app, '/mcp-ind')
+  const { client, transport } = await mcpClient({ authorization: 'Bearer gate-token' }, fresh.app, '/mcp-ind')
+
+  const raw = await callToolText(client, 'graphql_query', { query: `{ notes { list_notes { id } } }` })
+  const result = JSON.parse(raw)
+  assert.ok(
+    result.errors?.some((e: { message: string }) => e.message.startsWith('HTTP_401')),
+    'the gate passed, but the routes refuse the gate token — two independent checks',
+  )
+  await client.close()
+  await transport.close()
+})
+
+test('auth gate: verifyToken returning null refuses with 401', async () => {
+  const fresh = createApp()
+  const gated = new HonoGqlMcp(fresh.app, { name: 'null-gate', auth: { verifyToken: () => null } })
+  gated.mountTo(fresh.app, '/mcp-null')
+  const res = await postTo(fresh.app, '/mcp-null', { authorization: 'Bearer anything' })
+  assert.equal(res.status, 401)
+  assert.ok(res.headers.get('www-authenticate')?.includes('invalid_token'))
+})
+
+test('auth gate: requiredScopes — missing scope → 403 with a scope hint', async () => {
+  const fresh = createApp()
+  const authInfo = (scopes: string[]) => ({ token: 't', clientId: 'c', scopes, expiresAt: Math.floor(Date.now() / 1000) + 3600 })
+  const gated = new HonoGqlMcp(fresh.app, {
+    name: 'scope-gate',
+    auth: {
+      verifyToken: (token) => (token === 'no-scope' ? authInfo([]) : authInfo(['mcp'])),
+      requiredScopes: ['mcp'],
+    },
+  })
+  gated.mountTo(fresh.app, '/mcp-scope')
+
+  const denied = await postTo(fresh.app, '/mcp-scope', { authorization: 'Bearer no-scope' })
+  assert.equal(denied.status, 403)
+  assert.ok(denied.headers.get('www-authenticate')?.includes('insufficient_scope'))
+  assert.ok(denied.headers.get('www-authenticate')?.includes('scope="mcp"'))
+
+  const allowed = await postTo(fresh.app, '/mcp-scope', { authorization: 'Bearer ok' })
+  assert.equal(allowed.status, 200)
+})
+
+test('auth: per-tool scopes — graphql_mutation demands notes:write (pre-dispatch 403)', async () => {
+  // A dedicated app WITHOUT route-level auth: the gate is the only verifier,
+  // so reader/writer tokens exercise the scope machinery in isolation.
+  const items: Array<{ id: string; title: string }> = [{ id: 'i1', title: 'seed' }]
+  let next = 2
+  const app = new OpenAPIHono()
+  const Item = z.object({ id: z.string(), title: z.string() }).meta({ title: 'Item' })
+  app.openapi(
+    createRoute({
+      method: 'get',
+      path: '/items',
+      tags: ['items'],
+      operationId: 'list_items',
+      responses: { 200: { description: 'ok', content: { 'application/json': { schema: z.array(Item) } } } },
+    }),
+    (c) => c.json(items, 200),
+  )
+  app.openapi(
+    createRoute({
+      method: 'post',
+      path: '/items',
+      tags: ['items'],
+      operationId: 'create_item',
+      request: { body: { content: { 'application/json': { schema: z.object({ title: z.string() }) } } } },
+      responses: { 201: { description: 'created', content: { 'application/json': { schema: Item } } } },
+    }),
+    (c) => {
+      const item = { id: `i${next++}`, title: c.req.valid('json').title }
+      items.push(item)
+      return c.json(item, 201)
+    },
+  )
+
+  const authInfo = (scopes: string[]) => ({ token: 't', clientId: 'c', scopes, expiresAt: Math.floor(Date.now() / 1000) + 3600 })
+  const gated = new HonoGqlMcp(app, {
+    name: 'tool-scopes',
+    allowMutation: true,
+    auth: {
+      verifyToken: (token) =>
+        token === 'writer-token' ? authInfo(['mcp', 'items:write']) : authInfo(['mcp']),
+      toolScopes: { graphql_mutation: ['items:write'] },
+    },
+  })
+  gated.mountTo(app, '/mcp-ts')
+
+  // Reader: queries pass, the write tool is refused before dispatch.
+  const reader = await mcpClient({ authorization: 'Bearer reader-token' }, app, '/mcp-ts')
+  const read = await callToolText(reader.client, 'graphql_query', {
+    query: `{ items { list_items { title } } }`,
+  })
+  assert.ok(JSON.parse(read).data.items.list_items.length >= 1)
+  await assert.rejects(
+    () =>
+      reader.client.callTool({
+        name: 'graphql_mutation',
+        arguments: { query: `mutation { items { create_item(body: { title: "nope" }) { id } } }` },
+      }),
+    /403|insufficient/i,
+  )
+  await reader.client.close()
+  await reader.transport.close()
+
+  // Writer: the mutation runs and is visible.
+  const writer = await mcpClient({ authorization: 'Bearer writer-token' }, app, '/mcp-ts')
+  const created = JSON.parse(
+    await callToolText(writer.client, 'graphql_mutation', {
+      query: `mutation { items { create_item(body: { title: "scoped write" }) { title } } }`,
+    }),
+  )
+  assert.equal(created.data.items.create_item.title, 'scoped write')
+  await writer.client.close()
+  await writer.transport.close()
+})
+
+test('auth: discovery — RFC 9728/8414 well-known routes, normal paths untouched', async () => {
+  const fresh = createApp()
+  const gated = new HonoGqlMcp(fresh.app, {
+    name: 'discovery',
+    auth: {
+      sharedSecret: 'demo-secret',
+      resourceMetadataUrl: 'http://localhost:8100/.well-known/oauth-protected-resource/mcp-d',
+      discovery: {
+        resourceServerUrl: 'http://localhost:8100/mcp-d',
+        authorizationServerMetadata: {
+          issuer: 'https://idp.example.com',
+          authorization_endpoint: 'https://idp.example.com/authorize',
+          token_endpoint: 'https://idp.example.com/token',
+        } as never,
+        scopesSupported: ['mcp', 'notes:write'],
+        resourceName: 'notes-api',
+      },
+    },
+  })
+  gated.mountTo(fresh.app, '/mcp-d')
+
+  const prm = await fresh.app.request('/.well-known/oauth-protected-resource/mcp-d')
+  assert.equal(prm.status, 200)
+  const prmBody = (await prm.json()) as { resource: string; authorization_servers: string[]; scopes_supported: string[] }
+  assert.equal(prmBody.resource, 'http://localhost:8100/mcp-d')
+  assert.deepEqual(prmBody.authorization_servers, ['https://idp.example.com'])
+  assert.deepEqual(prmBody.scopes_supported, ['mcp', 'notes:write'])
+
+  const as = await fresh.app.request('/.well-known/oauth-authorization-server')
+  assert.equal(as.status, 200)
+  assert.equal(((await as.json()) as { issuer: string }).issuer, 'https://idp.example.com')
+
+  // The well-known middleware falls through — regular routes unaffected.
+  const notes = await fresh.app.request('/notes', { headers: AUTH })
+  assert.equal(notes.status, 200)
+})
+
+test('auth: config errors — verifier sources are mutually exclusive and required', () => {
+  assert.throws(
+    () => new HonoGqlMcp(createApp().app, { auth: {} }),
+    (e: unknown) => e instanceof Error && e.name === 'HonoGqlMcpConfigError',
+  )
+  assert.throws(
+    () =>
+      new HonoGqlMcp(createApp().app, {
+        auth: { verifyToken: () => null, sharedSecret: 'x' },
+      }),
+    (e: unknown) => e instanceof Error && /only one/.test(e.message),
+  )
+})
+
 // -- runner ----------------------------------------------------------------------
 let failed = 0
 for (const [name, fn] of tests) {

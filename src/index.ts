@@ -24,15 +24,11 @@ import type { OpenAPIHono } from '@hono/zod-openapi'
 import { RouterGraphQLHandler } from './handler.ts'
 import { buildMcpHandler, mountMcp, PROGRESSIVE_THRESHOLD, type RateLimitOptions, type ResolvedMode, type ToolMode } from './mcp.ts'
 import { mountGraphQL, type GraphqlMountOptions } from './http-api.ts'
+import { resolveAuth, type AuthDiscoveryOptions, type AuthOptions, type ResolvedAuth } from './auth.ts'
+import { HonoGqlMcpConfigError } from './errors.ts'
 import type { ScanFilters } from './scanner.ts'
 
-/** Invalid construction options — thrown before anything is derived. */
-export class HonoGqlMcpConfigError extends Error {
-  constructor(message: string) {
-    super(message)
-    this.name = 'HonoGqlMcpConfigError'
-  }
-}
+export { HonoGqlMcpConfigError } from './errors.ts'
 
 export interface BridgeOptions extends ScanFilters {
   /** MCP server name (shows in tool listings). Default 'hono-app'. */
@@ -77,6 +73,13 @@ export interface BridgeOptions extends ScanFilters {
    * stored); pass keyBy to key differently.
    */
   rateLimit?: RateLimitOptions
+  /**
+   * Gate the MCP endpoint: Bearer verification (401), endpoint-level and
+   * per-tool scopes (403), optional RFC 9728 discovery documents.
+   * See AuthOptions — one token, two checks: the gate verifies the endpoint,
+   * the routes' own security schemes verify business calls.
+   */
+  auth?: AuthOptions
 }
 
 export class HonoGqlMcp {
@@ -91,6 +94,7 @@ export class HonoGqlMcp {
   readonly #mode: ResolvedMode
   readonly #maxResponseChars: number
   readonly #rateLimit: RateLimitOptions | undefined
+  readonly #auth: ResolvedAuth | undefined
   #httpHandler?: McpHttpHandler
 
   constructor(app: OpenAPIHono<any>, opts: BridgeOptions = {}) {
@@ -109,6 +113,8 @@ export class HonoGqlMcp {
     if (opts.rateLimit && (!Number.isInteger(opts.rateLimit.maxPerSecond) || opts.rateLimit.maxPerSecond < 1)) {
       throw new HonoGqlMcpConfigError(`rateLimit.maxPerSecond must be a positive integer`)
     }
+    // Resolve auth before anything else is derived — bad combinations fail fast.
+    const auth = opts.auth ? resolveAuth(opts.auth) : undefined
 
     this.#name = opts.name ?? 'hono-app'
     this.#version = opts.version ?? '0.1.0'
@@ -131,6 +137,7 @@ export class HonoGqlMcp {
     this.resolvedMode = this.#mode
     this.#maxResponseChars = maxResponseChars
     this.#rateLimit = opts.rateLimit
+    this.#auth = auth
     this.#instructions =
       opts.instructions ??
       [
@@ -181,8 +188,9 @@ export class HonoGqlMcp {
       allowMutation: this.#allowMutation,
       mode: this.#mode,
       maxResponseChars: this.#maxResponseChars,
+      ...(this.#auth?.toolScopes ? { toolScopes: this.#auth.toolScopes } : {}),
     })
-    mountMcp(app, this.#httpHandler, path, this.#rateLimit)
+    mountMcp(app, this.#httpHandler, path, this.#rateLimit, this.#auth)
   }
 
   /** Mount the plain-GraphQL HTTP face: POST /graphql + GET /graphiql (shares the passthrough whitelist). */
@@ -216,6 +224,8 @@ export { RouterGraphQLHandler, documentDepth } from './handler.ts'
 export { GraphQLJSON } from './zod-to-graphql.ts'
 export { LruCache } from './lru.ts'
 export { DomainRegistry, domainsFor } from './domains.ts'
+export type { AuthOptions, AuthDiscoveryOptions, ResolvedAuth } from './auth.ts'
 export type { SkipRecord, DegradedRecord } from './schema-builder.ts'
 export type { ReadinessReport } from './handler.ts'
 export type { ToolMode, ResolvedMode, RateLimitOptions } from './mcp.ts'
+export type { AuthInfo } from '@modelcontextprotocol/server'

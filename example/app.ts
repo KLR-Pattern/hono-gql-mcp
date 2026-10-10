@@ -141,12 +141,13 @@ export function createApp() {
   ]
 
   // The ONLY credential verifier — the bridge never holds tokens of its own.
-  // The bridge's own endpoints (/mcp, /graphql, /graphiql) stay open (a
-  // perimeter you control can gate them); business calls are verified
-  // route-by-route via per-caller passthrough.
+  // The bridge's own endpoints (/mcp*, /graphql, /graphiql) and the OAuth
+  // discovery documents (/.well-known/* — public by RFC 9728 design:
+  // clients discover BEFORE authenticating) stay open; business calls are
+  // verified route-by-route via per-caller passthrough.
   app.use('*', async (c, next) => {
-    const bridgeFace = /^\/(mcp|graphql|graphiql)/.test(c.req.path)
-    if (!bridgeFace && c.req.header('authorization') !== `Bearer ${TOKEN}`) {
+    const open = /^\/(mcp|graphql|graphiql)/.test(c.req.path) || c.req.path.startsWith('/.well-known/')
+    if (!open && c.req.header('authorization') !== `Bearer ${TOKEN}`) {
       return c.json({ error: 'unauthorized' }, 401)
     }
     await next()
@@ -190,7 +191,19 @@ export function createApp() {
   })
   bridge.mountTo(app, '/mcp')
   bridge.mountGraphQL(app) // POST /graphql + GraphiQL at /graphiql
-  return { app, bridge }
+
+  // A second, gated deployment over the same app — one token, two checks:
+  // the shared-secret gate verifies the ENDPOINT, and the same Bearer reaches
+  // the routes through per-caller passthrough, where the app's middleware
+  // verifies the BUSINESS CALL.
+  const secure = new HonoGqlMcp(app, {
+    name: 'notes-api-secure',
+    allowMutation: true,
+    auth: { sharedSecret: TOKEN },
+  })
+  secure.mountTo(app, '/mcp-secure')
+
+  return { app, bridge, secure }
 }
 
 // ---- serve when run directly --------------------------------------------------
@@ -202,6 +215,7 @@ if (isMain) {
     console.log(`notes-api demo`)
     console.log(`  REST     http://localhost:${info.port}/notes  (authorization: Bearer ${TOKEN})`)
     console.log(`  MCP      http://localhost:${info.port}/mcp`)
+    console.log(`  MCP+auth http://localhost:${info.port}/mcp-secure  (shared-secret gate, same Bearer)`)
     console.log(`\nDerived GraphQL schema (${bridge.handler.domains.length} domains):\n`)
     console.log(bridge.handler.getSDL())
   })
