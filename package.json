@@ -1,6 +1,6 @@
 {
   "name": "hono-gql-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "The agent access layer for Hono — derive a GraphQL schema from your zod-openapi routes, expose MCP with a constant 2-tool set",
   "type": "module",
   "main": "./dist/index.js",
