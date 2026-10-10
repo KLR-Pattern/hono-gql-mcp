@@ -10,7 +10,7 @@ import { serve } from '@hono/node-server'
 import { pathToFileURL } from 'node:url'
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
 import { httpInstrumentationMiddleware } from '@hono/otel'
-import { HonoGqlMcp } from '../src/index.ts'
+import { bridgeValidator, HonoGqlMcp } from '../src/index.ts'
 
 // ---- domain models — .meta({ title }) names the GraphQL type ----------------
 const Note = z
@@ -189,6 +189,29 @@ export function createApp() {
     return c.json({ total: notes.size, by_tag: byTag }, 200)
   })
   app.openapi(categories, (c) => c.json(categoryTree, 200))
+
+  // The zValidator style — no createRoute, no registry: the wrapper exposes
+  // the schema for bridge introspection (a plain zValidator's schema is
+  // closure-private and cannot be derived).
+  app.get(
+    '/search',
+    bridgeValidator(
+      'query',
+      z.object({
+        q: z.string().min(1).describe('Search text.'),
+        limit: z.coerce.number().int().min(1).max(50).default(5).describe('Max hits.'),
+      }),
+      { tags: ['notes'], summary: 'Search notes by title.', responseSchema: z.array(Note) },
+    ),
+    (c) => {
+      const { q, limit } = c.req.valid('query')
+      const needle = q.toLowerCase()
+      const hits = [...notes.values()]
+        .filter((n) => n.title.toLowerCase().includes(needle))
+        .slice(0, limit)
+      return c.json(hits, 200)
+    },
+  )
 
   const bridge = new HonoGqlMcp(app, {
     name: 'notes-api',

@@ -12,7 +12,7 @@ import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/cli
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
 import type { Hono } from 'hono'
 import { createApp } from '../example/app.ts'
-import { HonoGqlMcp, LruCache, RouterGraphQLHandler } from '../src/index.ts'
+import { bridgeValidator, HonoGqlMcp, LruCache, RouterGraphQLHandler } from '../src/index.ts'
 
 const AUTH = { authorization: 'Bearer demo-secret' }
 const tests: Array<[name: string, fn: () => void | Promise<void>]> = []
@@ -979,6 +979,66 @@ test('otel: route.timeout and route.queue surface as events on graphql.execute',
   await queued.execute(`{ bench { a: slow(ms: 60) { slept } b: slow(ms: 60) { slept } } }`)
   const exec2 = exporter.getFinishedSpans().filter((s) => s.name === 'graphql.execute').pop()
   assert.ok(exec2?.events.some((e: { name: string }) => e.name === 'route.queue'), JSON.stringify(exec2?.events))
+})
+
+// -- bridgeValidator: the zValidator-style route source -----------------------------
+
+test('zValidator style: derived into the schema, typed args, callable, side by side with zod-openapi', async () => {
+  // createApp carries one bridgeValidator route (/notes/search) next to its
+  // zod-openapi routes — no DuplicateFieldError proves the two sources merge.
+  const sdl = handler.getSDL()
+  assert.ok(sdl.includes('get_search'), 'derived field present')
+  assert.ok(sdl.includes('"""Search text."""'), 'arg description flows')
+  assert.ok(sdl.includes('limit: Int = 5'), 'coerce+default maps to Int with default')
+
+  const result = await gql(`{ notes { get_search(q: "milk") { title } } }`)
+  assert.equal(JSON.stringify(d(result).notes.get_search), JSON.stringify([{ title: 'Buy milk' }]))
+})
+
+test('zValidator style: no responseSchema → raw-JSON bucket with a notice, not a skip', async () => {
+  const app2 = new OpenAPIHono()
+  app2.use('*', async (c, next) => {
+    if (c.req.header('authorization') !== 'Bearer demo-secret') return c.json({ error: 'unauthorized' }, 401)
+    await next()
+  })
+  app2.get(
+    '/ping',
+    bridgeValidator('query', z.object({ name: z.string() }), { tags: ['misc'], summary: 'Ping.' }),
+    (c) => c.json({ pong: c.req.valid('query').name }),
+  )
+  const h = new RouterGraphQLHandler(app2, { allowMutation: false })
+  assert.ok(h.getSDL().includes('get_ping(name: String!): JSON'), 'untyped response degrades to JSON')
+  assert.ok(
+    h.degraded.some((r) => r.path === '/ping' && r.reason.includes('no typed 2xx')),
+    JSON.stringify(h.degraded),
+  )
+  assert.equal(h.skips.length, 0, 'still callable — degradation, not a skip')
+  const result = await h.execute(`{ misc { get_ping(name: "x") } }`, undefined, {
+    headers: { authorization: 'Bearer demo-secret' },
+  })
+  assert.equal(JSON.stringify(d(result).misc.get_ping), JSON.stringify({ pong: 'x' }))
+})
+
+test('zValidator style: form target and wildcard paths are skipped; filters apply', () => {
+  const app3 = new OpenAPIHono()
+  app3.post('/upload', bridgeValidator('form', z.object({})), (c) => c.text('ok'))
+  app3.get('/wild/*', bridgeValidator('query', z.object({})), (c) => c.text('ok'))
+  app3.get(
+    '/kept',
+    bridgeValidator('query', z.object({}), { tags: ['keep'] }),
+    (c) => c.text('ok'),
+  )
+  const h = new RouterGraphQLHandler(app3)
+  // form/wildcard validator routes are dropped at the scanner (silently —
+  // there is no RouteConfig to classify into the skip buckets).
+  assert.ok(!h.getSDL().includes('upload'), 'form body silently dropped')
+  assert.ok(!h.getSDL().includes('wild'), 'wildcard path silently dropped')
+  assert.ok(h.getSDL().includes('get_kept'), 'normal validator route kept')
+
+  const filtered = new RouterGraphQLHandler(app3, { includeTags: ['keep'] })
+  assert.ok(filtered.getSDL().includes('get_kept'), 'tag filter matches validator routes')
+  const excluded = new RouterGraphQLHandler(app3, { exclude: ['/kept'] })
+  assert.ok(!excluded.getSDL().includes('get_kept'), 'path filter drops validator routes')
 })
 
 // -- runner ----------------------------------------------------------------------

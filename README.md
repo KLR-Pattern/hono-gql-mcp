@@ -51,6 +51,37 @@ Three steps, each the direct counterpart of the Python original:
 | `passthrough_headers=["authorization"]` | same default, case-insensitive whitelist |
 | fastmcp | `@modelcontextprotocol/server` 2.x `createMcpHandler` + `McpServer` |
 
+### zValidator-style routes
+
+Routes written with plain `@hono/zod-validator` cannot be derived — the
+schema lives in the validator's closure and nothing exposes it at runtime.
+`bridgeValidator` is a drop-in wrapper (zValidator behavior unchanged) that
+attaches the schema to the middleware under a well-known Symbol, which the
+scanner reads as a second introspection source — one import line is the
+whole migration:
+
+```ts
+import { bridgeValidator } from 'hono-gql-mcp'
+
+app.get(
+  '/search',
+  bridgeValidator('query', SearchQuery, {
+    tags: ['notes'],                      // domain grouping
+    summary: 'Search notes by title.',
+    responseSchema: z.array(Note),        // without it → the raw-JSON bucket
+  }),
+  (c) => c.json(hits),                    // c.req.valid() types flow as with zValidator
+)
+```
+
+Semantics vs zod-openapi routes: `param`/`query`/`json` targets map to
+params/query/body arguments; `form` targets and wildcard paths are dropped
+(silently — no RouteConfig exists to classify into skip buckets); tags and
+path filters apply the same way; the field name derives as
+`<method>_<path>` when no operationId concept applies. zod-openapi routes
+(registered via `app.openapi`) never duplicate — their handlers carry no
+Symbol.
+
 ### The Zod mapper
 
 The one piece with no existing wheel (verified 2026-10: GQLoom is the only
@@ -295,7 +326,7 @@ Two implementation notes (both regression-tested):
 
 ## Verified (PoC, 2026-10-10)
 
-`npm test` — 47 end-to-end checks, all passing (plain `node`, type-stripping mode):
+`npm test` — 50 end-to-end checks, all passing (plain `node`, type-stripping mode):
 
 - composition across 3 domains (nested tag included); field selection;
   partial failure (a 404 route nulls only itself, siblings survive)
@@ -336,6 +367,10 @@ Two implementation notes (both regression-tested):
   route span, one traceId) with a real in-memory exporter + AsyncHooks
   context manager; envelope traceparent joining the CALLER's trace;
   route.timeout / route.queue as span events on graphql.execute
+- bridgeValidator routes: derived beside zod-openapi routes (no
+  DuplicateFieldError), typed args flowing, callable end to end; no
+  responseSchema → the raw-JSON bucket with a notice (not a skip); form
+  targets and wildcard paths dropped; tag/path filters apply
 - plus a real-socket smoke test: REST 401/200, MCP initialize → tools/list →
   tools/call with and without credentials, `/graphql` + `/graphiql`
 
@@ -344,8 +379,6 @@ Stack: hono 4.13 · @hono/zod-openapi 1.6 (Zod v4 only) · graphql-js 17 ·
 
 ## Not in the PoC (the Python original has them)
 
-- zValidator-style routes (schema is closure-private — needs a thin
-  Symbol-attachment wrapper, ~50 lines, rhinobase/hono-openapi precedent)
 - sub-app mounting (`app.route()` + `basePath()`): registry path merging was
   verified in isolation during research; not covered by this test suite
 - benchmark comparison against fastmcp-TS `fromOpenAPI` / ClawQL (the Python
@@ -358,7 +391,7 @@ Stack: hono 4.13 · @hono/zod-openapi 1.6 (Zod v4 only) · graphql-js 17 ·
 
 ```bash
 npm install
-npm test          # 47 e2e checks (plain node — type stripping, no bundler)
+npm test          # 50 e2e checks (plain node — type stripping, no bundler)
 npm run example   # notes demo on :8100 — REST + /mcp + /mcp-secure (gated) + /graphql + /graphiql
 HONO_GQL_MCP_OTEL=1 npm run example   # + route spans under graphql.execute
 npm run typecheck

@@ -30,7 +30,7 @@ import {
   type SelectionSetNode,
 } from 'graphql'
 import type { OpenAPIHono } from '@hono/zod-openapi'
-import { scanRoutes, type RouteInfo, type ScanFilters } from './scanner.ts'
+import { scanRoutes, scanValidatorRoutes, type RouteInfo, type ScanFilters } from './scanner.ts'
 import {
   buildSchema,
   type DegradedRecord,
@@ -129,7 +129,9 @@ export class RouterGraphQLHandler {
   #sdl?: string
 
   constructor(app: OpenAPIHono<any>, opts: HandlerOptions = {}) {
-    this.routes = scanRoutes(app.openAPIRegistry, opts)
+    // Two introspection sources: the zod-openapi registry, and Hono's own
+    // route table for bridgeValidator middleware (same filters on both).
+    this.routes = [...scanRoutes(app.openAPIRegistry, opts), ...scanValidatorRoutes(app, opts)]
     const executor = new RouteExecutor(app as never, opts.passthroughHeaders ?? ['authorization'], {
       requestTimeoutMs: withDefault(opts.requestTimeoutMs, 30_000),
       maxConcurrency: withDefault(opts.maxConcurrency, 16),
