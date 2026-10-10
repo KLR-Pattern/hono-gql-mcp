@@ -9,6 +9,10 @@ TypeScript port of [fastapi-gql-mcp](../fastapi-gql-mcp)'s architecture
 (Apollo's "GraphQL as the MCP contract" pattern, applied to REST-first
 services — the position no TS project occupied as of 2026-10).
 
+> **Status:** published as [`hono-gql-mcp`](https://www.npmjs.com/package/hono-gql-mcp)
+> `0.1.1`. Still a PoC — see [Package status](#package-status) for what the
+> build does and does not cover yet.
+
 ```ts
 import { OpenAPIHono } from '@hono/zod-openapi'
 import { HonoGqlMcp } from 'hono-gql-mcp'
