@@ -79,4 +79,11 @@ jobs:
       # --provenance attaches a signed statement linking the tarball to this
       # commit and workflow run. --access public keeps the package installable
       # without a paid plan (scoped packages default to restricted).
+      #
+      # If this step fails with E404 ("PUT ... Not found") even though the
+      # provenance statement was signed above, the cause is the trusted
+      # publisher's Allowed actions list, not a missing package: npm answers
+      # 404 rather than 403 for an unauthorized write. Ticking only the default
+      # (`npm stage publish`) leaves `npm publish` refused. Enable `npm publish`
+      # in the package's Settings -> Trusted Publisher, then re-run this job.
       - run: npm publish --provenance --access public

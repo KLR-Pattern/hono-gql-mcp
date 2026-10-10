@@ -415,6 +415,14 @@ surfaces as `ENEEDAUTH`):
 | Environment | *(leave empty)* |
 | Allowed actions | must permit **`npm publish`** — only `npm stage publish` is allowed by default |
 
+Getting `Allowed actions` wrong produces a confusing failure: the provenance
+statement is signed successfully (so OIDC is clearly working), then the publish
+returns **`E404 Not Found - PUT .../hono-gql-mcp`**. npm deliberately answers
+404 rather than 403 for an unauthorized write, so the message points at the
+package rather than at the permission. If you see a signed provenance line
+followed by E404, enable `npm publish` and re-run the job — nothing is wrong
+with the package or the workflow.
+
 `package.json` carries a `repository.url` matching the GitHub repo; npm requires
 that exact match for OIDC. A fresh trusted-publisher configuration must complete
 its first publish **within 2 days** or it expires and must be recreated.
