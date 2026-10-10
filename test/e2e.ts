@@ -20,7 +20,8 @@ import { DB_PATH, DEMO_OWNER } from '../example/store.ts'
 for (const suffix of ['', '-wal', '-shm']) rmSync(`${DB_PATH}${suffix}`, { force: true })
 
 const { createApp } = await import('../example/app.ts')
-import { bridgeValidator, HonoGqlMcp, LruCache, RouterGraphQLHandler } from '../src/index.ts'
+import { parse, validate } from 'graphql'
+import { bridgeValidator, documentDepth, HonoGqlMcp, LruCache, RouterGraphQLHandler } from '../src/index.ts'
 
 const tests: Array<[name: string, fn: () => void | Promise<void>]> = []
 const test = (name: string, fn: () => void | Promise<void>) => tests.push([name, fn])
@@ -340,6 +341,173 @@ test('hardening: LruCache — recency refresh, capacity bound, 0 disables', () =
   const off = new LruCache<string>(0)
   off.set('a', '1')
   assert.equal(off.get('a'), undefined)
+})
+
+test('hardening: mutations run SERIALLY in document order despite domain grouping', async () => {
+  // The spec serializes ROOT mutation fields. Tags wrap writes in a group
+  // object type, so the root holds one group field and the writes beneath it
+  // would run CONCURRENTLY — the guarantee was lost by the grouping. The
+  // resolver-side SerialQueue restores it; this pins that.
+  const order: string[] = []
+  const app3 = new OpenAPIHono()
+  app3.openapi(
+    createRoute({
+      method: 'get',
+      path: '/readable',
+      tags: ['read'],
+      operationId: 'readable',
+      responses: { 200: okResponse(z.object({ v: z.string() })) },
+    }),
+    (c) => c.json({ v: 'x' }, 200),
+  )
+  // `a` sleeps longest, so a concurrent run would finish it LAST.
+  for (const n of ['a', 'b', 'c']) {
+    app3.openapi(
+      createRoute({
+        method: 'post',
+        path: `/w${n}`,
+        tags: ['writes'],
+        operationId: `w_${n}`,
+        responses: { 200: okResponse(z.object({ v: z.string() })) },
+      }),
+      async (c) => {
+        order.push(`start:${n}`)
+        await new Promise((r) => setTimeout(r, n === 'a' ? 60 : 5))
+        order.push(`end:${n}`)
+        return c.json({ v: n }, 200)
+      },
+    )
+  }
+  const h = new RouterGraphQLHandler(app3, { allowMutation: true })
+  const result = await h.execute(`mutation { writes { w_a { v } w_b { v } w_c { v } } }`)
+  assert.equal(result.errors, undefined)
+  assert.equal(order.join(','), 'start:a,end:a,start:b,end:b,start:c,end:c', order.join(' '))
+})
+
+test('hardening: array query args travel as repeated keys, not a joined string', async () => {
+  // URLSearchParams.set() would send ?tags=a%2Cb and the route's own
+  // z.array(z.string()) validation would answer 400. GraphQL sends a JSON
+  // array; it has to become ?tags=a&tags=b.
+  let seen: unknown = null
+  const app4 = new OpenAPIHono()
+  app4.openapi(
+    createRoute({
+      method: 'get',
+      path: '/search',
+      tags: ['q'],
+      operationId: 'search',
+      request: { query: z.object({ tags: z.array(z.string()).optional(), q: z.string().optional() }) },
+      responses: { 200: okResponse(z.object({ got: z.string() })) },
+    }),
+    (c) => {
+      seen = c.req.valid('query')
+      return c.json({ got: 'ok' }, 200)
+    },
+  )
+  const h = new RouterGraphQLHandler(app4)
+  const result = await h.execute(`{ q { search(tags: ["a", "b"], q: "x") { got } } }`)
+  assert.equal(result.errors, undefined, JSON.stringify(result.errors))
+  assert.deepEqual(seen, { tags: ['a', 'b'], q: 'x' })
+})
+
+test('config: an empty type Query is reported, not thrown at request time', async () => {
+  // A write-only app (or filters that kept nothing) leaves `type Query` with no
+  // fields — graphql-js then considers the whole schema invalid. Construction
+  // must still succeed (the library's own filters can produce this state), and
+  // execute() must answer with a typed error rather than a raw Error.
+  const writesOnly = new OpenAPIHono()
+  writesOnly.openapi(
+    createRoute({
+      method: 'post',
+      path: '/w',
+      tags: ['w'],
+      operationId: 'w',
+      responses: { 200: okResponse(z.object({ v: z.string() })) },
+    }),
+    (c) => c.json({ v: 'x' }, 200),
+  )
+  const h = new RouterGraphQLHandler(writesOnly, { allowMutation: true })
+  assert.equal(h.hasQueryOperations, false)
+  const result = await h.execute(`{ __typename }`)
+  assert.ok(result.errors?.[0]?.message.startsWith('NO_QUERY_OPERATIONS'), JSON.stringify(result.errors))
+
+  // Filters that drop every read route reach the same state.
+  const filtered = new RouterGraphQLHandler(filterApp(), { includeTags: ['nomatch'] })
+  assert.equal(filtered.hasQueryOperations, false)
+  // A normal app is unaffected.
+  assert.equal(new RouterGraphQLHandler(filterApp()).hasQueryOperations, true)
+})
+
+test('readiness: a type-name rename is reported but does NOT block ready', async () => {
+  // GraphQL has one global type namespace, so two schemas sharing a
+  // .meta({ title }) force a rename. That costs no capability, so it must not
+  // flip `ready` — otherwise an `assert report.ready` CI gate fails on a
+  // harmless collision and gets turned off.
+  const A = z.object({ v: z.string() }).meta({ title: 'Item' })
+  const B = z.object({ w: z.string() }).meta({ title: 'Item' })
+  const app5 = new OpenAPIHono()
+  for (const [path, schema, id] of [['/a', A, 'op_a'], ['/b', B, 'op_b']] as const) {
+    app5.openapi(
+      createRoute({ method: 'get', path, tags: ['t'], operationId: id, responses: { 200: okResponse(schema) } }),
+      (c) => c.json({ v: 'x' }, 200),
+    )
+  }
+  const h = new RouterGraphQLHandler(app5)
+  const report = h.readiness()
+  assert.equal(report.degradedFields.length, 0, 'a rename is not a degradation')
+  assert.ok(report.renames.some(([name, reason]) => name === 'Item' && reason.includes('Item_2')), JSON.stringify(report.renames))
+  assert.equal(report.ready, true, 'a rename must not make the bridge unready')
+})
+
+test('hardening: fragments do not add to maxDepth', async () => {
+  // An inline fragment and a spread both contribute to the SAME selection set;
+  // GraphQL inlines them before execution. Counting a level for either made a
+  // fragment-organized document measure deeper than the identical inline one.
+  const app6 = new OpenAPIHono()
+  app6.openapi(
+    createRoute({
+      method: 'get',
+      path: '/c',
+      tags: ['t'],
+      operationId: 'c',
+      responses: { 200: okResponse(z.object({ name: z.string() })) },
+    }),
+    (c) => c.json({ name: 'x' }, 200),
+  )
+  const h = new RouterGraphQLHandler(app6)
+  const inline = `{ t { c { name } } }`
+  const viaFragment = `query { ...F } fragment F on Query { t { c { name } } }`
+  const viaInlineFragment = `{ ... on Query { t { c { name } } } }`
+  assert.equal(documentDepth(parse(inline)), 3)
+  assert.equal(documentDepth(parse(viaFragment)), 3, 'a spread adds no depth')
+  assert.equal(documentDepth(parse(viaInlineFragment)), 3, 'an inline fragment adds no depth')
+  for (const doc of [inline, viaFragment, viaInlineFragment]) {
+    assert.equal((await h.execute(doc)).errors, undefined, doc)
+  }
+  // Real nesting is still enforced.
+  const limited = new RouterGraphQLHandler(app6, { maxDepth: 2 })
+  assert.ok((await limited.execute(inline)).errors?.some((e) => e.message.includes('max_depth')))
+})
+
+test('MCP: the graphql_query example is a real, executable document', async () => {
+  // The description is read by an LLM that copies it verbatim — a hardcoded
+  // example goes stale as soon as an operationId or response schema changes.
+  const big = bigApp()
+  const bridge = new HonoGqlMcp(big, { name: 'example-check' })
+  bridge.mountTo(big, '/mcp-example')
+  const { client, transport } = await mcpClient({}, big, '/mcp-example')
+  const { tools } = await client.listTools()
+  const described = tools.find((t) => t.name === 'graphql_query')?.inputSchema as
+    | { properties?: { query?: { description?: string } } }
+    | undefined
+  const example = described?.properties?.query?.description?.match(/e\.g\. (.+)$/)?.[1]
+  assert.ok(example, `no example in the description: ${described?.properties?.query?.description}`)
+  // It must be valid AND runnable against this very app.
+  assert.deepEqual(validate(bridge.handler.schema, parse(example)), [])
+  const result = JSON.parse(await callToolText(client, 'graphql_query', { query: example }))
+  assert.equal(result.errors, undefined, JSON.stringify(result.errors))
+  await client.close()
+  await transport.close()
 })
 
 test('hardening: document cache caches the front half — execution stays live', async () => {

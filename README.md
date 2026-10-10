@@ -39,6 +39,20 @@ Three steps, each the direct counterpart of the Python original:
    middleware, auth and validation behave exactly as over HTTP. Sibling
    fields resolve concurrently.
 
+### Mutation ordering
+
+Reads run concurrently. Writes run **serially, in document order** — one
+mutation per `execute()` call, so two in-flight documents never serialize
+against each other.
+
+This needs the explicit `SerialQueue` in `executor.ts` because the tag grouping
+hides the write fields from graphql-js's own serializer. The spec serializes
+*root* mutation fields, but a tagged write lands at
+`mutation { notes { create_note } }` — the root holds the single group field
+`notes`, and the writes beneath it are ordinary object fields, which graphql-js
+resolves concurrently. Resolvers reach the queue in document order, and a FIFO
+chain restores the guarantee. A failing write does not block its successors.
+
 ### Architecture map to fastapi-gql-mcp
 
 | fastapi-gql-mcp (Python) | hono-gql-mcp (TS) |
@@ -97,6 +111,9 @@ directionally-similar project, 0.x and stale on npm). Mapping rules:
 - `z.pipe` → input side maps from `.in`, output side from `.out`
 - `z.coerce` query params map by their OUTPUT type (GraphQL sends a JSON
   number; it is stringified into the query string, the route's coerce parses it)
+- `z.array` query args travel as **repeated keys** (`?tags=a&tags=b`), which is
+  what Hono's query parser collects back into an array. `URLSearchParams.set()`
+  would send `?tags=a,b` and the route's own `z.array()` check would answer 400
 
 ## Capability buckets
 
@@ -114,6 +131,20 @@ DuplicateFieldError are startup facts, not first-query surprises):
 
 Leaf fields are always nullable: a failing route nulls only its own field (a
 NonNull leaf would propagate the error to its whole domain group).
+
+Two states need a word, because both are reachable through ordinary
+configuration rather than misuse:
+
+- **No read route survived the scan.** `type Query` then has no fields, and
+  graphql-js treats the whole schema as invalid — every document, valid or not,
+  would make it throw. A write-only app, or filters that kept nothing, gets
+  here. Construction still succeeds (your own filters may have done this on
+  purpose); `handler.hasQueryOperations` reports it, a startup warning names it,
+  and `graphql_query` refuses documents with a `NO_QUERY_OPERATIONS` error.
+- **Two schemas share a `.meta({ title })`.** GraphQL has one global type
+  namespace, so the second is renamed (`Item` → `Item_2`). That costs no
+  capability, so it is reported as `readiness().renames` and **does not** affect
+  `ready` — an `assert report.ready` CI gate has to stay meaningful.
 
 ## Progressive disclosure (large apps)
 
@@ -205,7 +236,9 @@ Four knobs, on by default with the same semantics as the Python bridge:
   per document, fragments resolved and cycle-guarded. Recursive types make
   depth unbounded and an MCP caller is an LLM that can emit runaway nesting;
   over-deep documents are rejected with a validation-style error **before
-  anything executes**.
+  anything executes**. Fragments do not count: a spread and an inline fragment
+  contribute fields to the selection set they appear in, so they add no depth
+  (`__`-prefixed introspection meta-fields are exempt for the same reason).
 - **`maxConcurrency`** (default 16, `null` disables) — bound on in-flight
   route calls across all queries (FIFO semaphore). Sibling fields resolve
   concurrently; this protects the wrapped app from being hammered by its own
@@ -222,9 +255,14 @@ fixed-window limiter keyed by a hash of the caller's authorization header
 (credentials are never stored) — `keyBy` customizes the key.
 
 `readiness()` returns the CI-assertable audit — `{ ready, skips, degraded,
-degradedFields }` — the same classifier the startup notices come from, so the
-report and the warnings can never drift apart. `assert report.ready` in CI
-pins the exposure you expect.
+degradedFields, renames }` — the same classifier the startup notices come from,
+so the report and the warnings can never drift apart. `assert report.ready` in
+CI pins the exposure you expect.
+
+Only `skips` and `degradedFields` count toward `ready`, because only they cost
+you a capability. `renames` is a separate list: a type name that had to be
+disambiguated. Keeping the two apart is what makes the CI gate usable — a
+harmless name collision must not fail an audit you would then switch off.
 
 ## Authentication
 
@@ -324,9 +362,80 @@ Two implementation notes (both regression-tested):
   stays a no-op until the host registers one, and extraction/injection must
   not depend on that.
 
-## Verified (PoC, 2026-10-10)
+## Package status
 
-`npm test` — 54 end-to-end checks, all passing (plain `node`, type-stripping mode):
+Publishable. `npm run build` emits `dist/` and `exports`/`files` point at it, so
+a consumer installs the JavaScript and its `.d.ts`, never the sources.
+
+Two details worth knowing before changing build config:
+
+- Sources import each other as `./x.ts` — that is what lets Node's type
+  stripping run them directly, with no bundler. `tsconfig.build.json` sets
+  `rewriteRelativeImportExtensions`, which turns those into `./x.js` on emit.
+  The `.d.ts` files keep the `.ts` specifier, which TypeScript resolves
+  correctly, so no post-processing step is needed.
+- The build uses `tsc` only. There is no bundler, so nothing in the emit
+  depends on how the package is consumed.
+
+### Releasing
+
+Push a tag that matches `package.json`'s version:
+
+```bash
+npm version patch        # or minor / major — writes package.json + the tag
+git push --follow-tags
+```
+
+`.github/workflows/publish.yml` then typechecks, runs the 61 checks, rebuilds,
+verifies the tag equals the version, and publishes with `--provenance`.
+
+Authentication is **OIDC trusted publishing** — no `NPM_TOKEN` secret exists in
+the repository. Trusted publishers are configured on the *package's* settings
+page, so the package has to exist on the registry first: **the very first
+version must be published manually**, and the workflow takes over from the
+second one.
+
+Bootstrap order:
+
+| # | Step | Where |
+| --- | --- | --- |
+| 1 | `npm login` then `npm publish --access public` | local, once |
+| 2 | Fill in the Trusted Publisher fields below | npmjs.com → package Settings |
+| 3 | `npm version patch && git push --follow-tags` | the workflow publishes |
+
+The Trusted Publisher fields, under the package's **Settings → Trusted
+Publisher** (all values are case-sensitive and must match exactly; a mismatch
+surfaces as `ENEEDAUTH`):
+
+| Field | Value |
+| --- | --- |
+| Organization or user | your GitHub account/org |
+| Repository | `hono-gql-mcp` |
+| Workflow filename | `publish.yml` — filename only, not a path, extension included |
+| Environment | *(leave empty)* |
+| Allowed actions | must permit **`npm publish`** — only `npm stage publish` is allowed by default |
+
+`package.json` carries a `repository.url` matching the GitHub repo; npm requires
+that exact match for OIDC. A fresh trusted-publisher configuration must complete
+its first publish **within 2 days** or it expires and must be recreated.
+
+CI builds on **Node 24 (Active LTS)**, read from `.nvmrc` — the single source of
+truth for the toolchain version. That matters for publishing: Node 24 ships
+**npm 11.19.0**, and OIDC trusted publishing needs **npm ≥ 11.5.0**. Node 22
+would ship npm 10.x and force an `npm install -g npm@latest` step on every run.
+The verified run (2026-10-11) used Node 24.21.0 / npm 11.19.0.
+
+## Verified (PoC, 2026-10-11)
+
+`npm test` — 61 end-to-end checks, all passing (plain `node`, type-stripping mode):
+
+- **regression guards for the 2026-10-11 review**: mutations serialize in
+  document order despite the domain-group wrapper (reverting the fix fails the
+  check); array query args arrive as arrays, not a comma-joined string;
+  a schema with an empty `type Query` reports instead of throwing at request
+  time; a type-name rename is reported without marking the bridge unready;
+  fragments add no depth; and the `graphql_query` description's example is
+  derived from the live schema and asserted runnable
 
 - composition across 3 domains (nested tag included); field selection;
   partial failure (a 404 route nulls only itself, siblings survive)
@@ -384,7 +493,12 @@ Two implementation notes (both regression-tested):
 
 Stack: hono 4.13 · @hono/zod-openapi 1.6 (Zod v4 only) · graphql-js 17 ·
 @modelcontextprotocol/server 2.3 · better-auth 1.7 (OAuth 2.1 AS + JWT) ·
-better-sqlite3 (persistence) · Node ≥ 22 (graphql-js 17's floor).
+better-sqlite3 (persistence).
+
+Runtime floor: **Node ≥ 22.18**. That is graphql-js 17's floor raised by two
+things this package depends on — type stripping to run its own sources, and
+`require(esm)`, which the MCP SDK's CJS neighbourhood needs. CI and `.nvmrc`
+track **Node 24 LTS**, and the suite passes on both 24.21.0 and 22.22.0.
 
 ## Not in the PoC (the Python original has them)
 
@@ -402,11 +516,18 @@ better-sqlite3 (persistence) · Node ≥ 22 (graphql-js 17's floor).
 
 ```bash
 npm install
-npm test          # 54 e2e checks (plain node — type stripping, no bundler)
+npm test          # 61 e2e checks (plain node — type stripping, no bundler)
 npm run example   # notes demo on :8020 — REST + Swagger + GitHub login + OAuth-gated /mcp + GraphiQL
 HONO_GQL_MCP_OTEL=1 npm run example   # + route spans under graphql.execute
-npm run typecheck
+npm run typecheck # noEmit — the repo runs from source
+npm run build     # emit dist/ for publishing
 ```
+
+`npm test` needs non-empty `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET`, because
+the example wires GitHub login and the `/mcp` gate only when both are set — and
+one check asserts that gate's 401 challenge. Placeholders are enough; the suite
+never calls GitHub. With `example/.env` present locally this is already the case.
+CI passes them as job-level env.
 
 `npm test` runs against a throwaway database (`test/.tmp/e2e.sqlite`, set by
 `test/e2e.env` and deleted at the start of each run), so it never touches the
@@ -464,3 +585,9 @@ same JWT passes the gate and reaches the routes.
 The runner is plain `node` (Node ≥ 22.18 strips types natively), not tsx —
 a bundler-style resolver loads two `@opentelemetry/api` instances from its
 exports map and silently breaks span nesting (see the Observability notes).
+
+Note the two runtimes this repo has: `npm test` and `npm run example` execute
+the TypeScript **sources** directly (Node's type stripping — that is why the
+code avoids parameter properties), while consumers of the published package get
+the emitted `dist/`. `npm run typecheck` follows the sources; `npm run build`
+is the only thing that reads `tsconfig.build.json`.

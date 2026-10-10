@@ -152,6 +152,12 @@ export class HonoGqlMcp {
         .filter(Boolean)
         .join(' ')
 
+    if (!this.handler.hasQueryOperations) {
+      console.warn(
+        `[${this.#name}] no read route survived the scan, so type Query has no fields and ` +
+          'graphql_query will refuse every document. Add a GET/HEAD route or widen the filters.',
+      )
+    }
     if (this.handler.skips.length > 0) {
       console.warn(
         `[${this.#name}] skipped ${this.handler.skips.length} route(s); handler.readiness().skips lists them with reasons:`,
@@ -166,6 +172,15 @@ export class HonoGqlMcp {
       )
       for (const d of this.handler.degraded) console.warn(`  ${d.method} ${d.path} (${d.field}) — ${d.reason}`)
       for (const [where, reason] of this.handler.degradedFields) console.warn(`  ${where} — ${reason}`)
+    }
+    // Informational only — a GraphQL type name had to be disambiguated.
+    // Deliberately outside the degradedTotal branch: it never affects readiness.
+    if (this.handler.renames.length > 0) {
+      console.warn(
+        `[${this.#name}] ${this.handler.renames.length} type name(s) renamed to disambiguate ` +
+          '(GraphQL has one global type namespace); handler.readiness().renames lists them:',
+      )
+      for (const [name, reason] of this.handler.renames) console.warn(`  ${name} — ${reason}`)
     }
     if (this.#mode === 'progressive') {
       console.warn(
@@ -221,6 +236,7 @@ export class HonoGqlMcp {
 }
 
 export { RouterGraphQLHandler, documentDepth } from './handler.ts'
+export { SerialQueue } from './executor.ts'
 export { GraphQLJSON } from './zod-to-graphql.ts'
 export { LruCache } from './lru.ts'
 export { DomainRegistry, domainsFor } from './domains.ts'

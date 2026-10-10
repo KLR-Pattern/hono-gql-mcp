@@ -27,7 +27,7 @@ import {
 } from '@modelcontextprotocol/server'
 import type { Hono } from 'hono'
 import { z } from 'zod'
-import { GraphQLError, GraphQLNonNull, GraphQLObjectType, GraphQLSchema, parse, printSchema, type GraphQLFieldConfig, type GraphQLObjectType as ObjType, type GraphQLType } from 'graphql'
+import { GraphQLError, GraphQLList, GraphQLNonNull, GraphQLObjectType, GraphQLSchema, parse, printSchema, validate, GraphQLBoolean, GraphQLEnumType, GraphQLFloat, GraphQLInt, GraphQLString, type GraphQLFieldConfig, type GraphQLObjectType as ObjType, type GraphQLType } from 'graphql'
 import type { RouterGraphQLHandler } from './handler.ts'
 import { groupTypeName } from './schema-builder.ts'
 import type { ResolvedAuth } from './auth.ts'
@@ -102,6 +102,66 @@ function walkGroup(root: ObjType | null | undefined, path: string[]): ObjType | 
   return current instanceof GraphQLObjectType ? current : null
 }
 
+/** Peel NonNull and List wrappers down to the named type. */
+const namedType = (t: GraphQLType): GraphQLType =>
+  t instanceof GraphQLNonNull || t instanceof GraphQLList ? namedType(t.ofType) : t
+
+/** A literal for an optional arg, so the sample needs no variables. */
+function literalFor(type: GraphQLType): string {
+  const bare = namedType(type)
+  if (bare instanceof GraphQLEnumType) return bare.getValues()[0]?.name ?? 'FIRST'
+  if (bare instanceof GraphQLObjectType) return '{}'
+  if (bare === GraphQLBoolean) return 'true'
+  if (bare === GraphQLInt || bare === GraphQLFloat) return '0'
+  return '""'
+}
+
+/** The shortest valid selection set for a type: first scalar, else recurse one level. */
+function selectFor(type: GraphQLType, depth: number, seen: Set<string>): string {
+  const bare = namedType(type)
+  if (!(bare instanceof GraphQLObjectType)) return ''
+  if (depth >= 2 || seen.has(bare.name)) return ' { __typename }'
+  const next = new Set(seen).add(bare.name)
+  for (const [name, field] of Object.entries(bare.getFields())) {
+    if (name.startsWith('__')) continue
+    const inner = selectFor(field.type, depth + 1, next)
+    return ` { ${name}${inner} }`
+  }
+  return ' { __typename }'
+}
+
+/**
+ * A minimal valid document for the first root field, built FROM the schema.
+ *
+ * A hardcoded example goes stale the moment a route's operationId or response
+ * schema changes, and an LLM reads this string and copies it. Derived from the
+ * live schema instead, and validated before it is offered — a sample that fails
+ * validation would be worse than no sample. Null when nothing can be built.
+ */
+function sampleQuery(schema: GraphQLSchema): string | null {
+  const groups = schema.getQueryType()?.getFields()
+  if (!groups) return null
+  const first = Object.entries(groups)[0]
+  if (!first) return null
+  const [groupName, groupField] = first
+  const group = namedType(groupField.type)
+  if (!(group instanceof GraphQLObjectType)) return null
+
+  const leaf = Object.entries(group.getFields())[0]
+  if (!leaf) return null
+  const [leafName, leafField] = leaf
+  const args = Object.entries(leafField.args ?? {})
+    .filter(([, a]) => !(a.type instanceof GraphQLNonNull))
+    .map(([name, a]) => `${name}: ${literalFor(a.type)}`)
+    .join(', ')
+  const doc = `{ ${groupName} { ${leafName}${args ? `(${args})` : ''}${selectFor(leafField.type, 0, new Set())} } }`
+  try {
+    return validate(schema, parse(doc)).length === 0 ? doc : null
+  } catch {
+    return null
+  }
+}
+
 /**
  * SDL fragment for one domain subtree, addressed exactly as in queries.
  * Re-wraps the schema's real group object up the ancestor chain with
@@ -174,6 +234,9 @@ const unknownDomain = (handler: RouterGraphQLHandler, domain: string): Envelope 
 }
 
 export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOptions): McpHttpHandler {
+  // The schema is immutable after build, so the sample document is computed
+  // once here — the factory below runs on every request.
+  const example = sampleQuery(handler.schema)
   return createMcpHandler((ctx) => {
     // Per-request: the caller's headers, captured here and passed down as
     // the GraphQL context — resolvers forward them through the whitelist.
@@ -221,7 +284,7 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
             'The full GraphQL SDL of this service. Routes are grouped into domains by tag. ' +
             'Read this once, then compose any routes in a single graphql_query.',
           annotations: { readOnlyHint: true },
-          ...scopeFor('get_schema'),
+            ...scopeFor('get_schema'),
         },
         async () => ({ content: [{ type: 'text', text: text(handler.getSDL()) }] }),
       )
@@ -243,7 +306,7 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
             "tag 'billing:invoice' yields domain 'billing' with subdomain 'invoice'. Untagged routes group by " +
             "their first path segment. Start here, then drill in with list_queries(domain).",
           annotations: { readOnlyHint: true },
-          ...scopeFor('list_domains'),
+            ...scopeFor('list_domains'),
         },
         async () => ({
           content: [{ type: 'text', text: text(ok({ domains: handler.registry.summary() }, 'Call list_queries(domain) with one of these domain paths.')) }],
@@ -261,7 +324,7 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
             domain: z.string().describe("Domain path from list_domains, e.g. 'billing:invoice'."),
           }),
           annotations: { readOnlyHint: true },
-          ...scopeFor('list_queries'),
+            ...scopeFor('list_queries'),
         },
         async ({ domain }) => {
           const path = resolve(domain)
@@ -297,7 +360,7 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
               domain: z.string().describe("Domain path from list_domains, e.g. 'billing'."),
             }),
             annotations: { readOnlyHint: true },
-          ...scopeFor('list_mutations'),
+            ...scopeFor('list_mutations'),
           },
           async ({ domain }) => {
             const path = resolve(domain)
@@ -324,7 +387,7 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
             domain: z.string().describe("Domain path from list_domains, e.g. 'billing:invoice'."),
           }),
           annotations: { readOnlyHint: true },
-          ...scopeFor('get_query_schema'),
+            ...scopeFor('get_query_schema'),
         },
         async ({ domain }) => {
           const path = resolve(domain)
@@ -371,7 +434,9 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
 
     // ---- executor tools (both modes) ---------------------------------------
     const queryInput = z.object({
-      query: z.string().describe('A GraphQL query document, e.g. { notes { list_notes { title } } }'),
+      query: z
+        .string()
+        .describe(`A GraphQL query document${example ? `, e.g. ${example}` : ''}`),
       variables: z.record(z.string(), z.unknown()).optional().describe('Query variables, if the document declares any'),
     })
 
@@ -384,7 +449,7 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
           'nulls only its own field while siblings survive. Select only the fields you need.',
         inputSchema: queryInput,
         annotations: { readOnlyHint: true },
-          ...scopeFor('graphql_query'),
+            ...scopeFor('graphql_query'),
       },
       async ({ query, variables }) => {
         if (operationTypeOf(query) !== 'query') {
@@ -407,7 +472,7 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
             variables: z.record(z.string(), z.unknown()).optional(),
           }),
           annotations: { destructiveHint: true },
-          ...scopeFor('graphql_mutation'),
+            ...scopeFor('graphql_mutation'),
         },
         async ({ query, variables }) => {
           if (operationTypeOf(query) !== 'mutation') {

@@ -3,44 +3,72 @@
   "version": "0.1.0",
   "description": "The agent access layer for Hono — derive a GraphQL schema from your zod-openapi routes, expose MCP with a constant 2-tool set",
   "type": "module",
-  "main": "src/index.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KLR-Pattern/hono-gql-mcp.git"
+  },
+  "homepage": "https://github.com/KLR-Pattern/hono-gql-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/KLR-Pattern/hono-gql-mcp/issues"
+  },
   "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "example": "node --env-file-if-exists=example/.env example/app.ts",
     "test": "node --env-file-if-exists=example/.env --env-file=test/e2e.env test/e2e.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.18"
   },
   "license": "MIT",
   "dependencies": {
-    "@asteasolutions/zod-to-openapi": "^9.1.0",
-    "@better-auth/cimd": "^1.7.7",
-    "@better-auth/mcp": "^1.7.7",
-    "@better-auth/memory-adapter": "^1.7.7",
-    "@hono/swagger-ui": "^0.6.1",
-    "@hono/zod-openapi": "^1.6.3",
     "@hono/zod-validator": "^0.9.1",
-    "@modelcontextprotocol/client": "^2.3.1",
-    "@modelcontextprotocol/hono": "^2.0.2",
     "@modelcontextprotocol/server": "^2.3.1",
     "@opentelemetry/api": "^1.9.1",
     "@opentelemetry/core": "^2.12.0",
-    "better-auth": "^1.7.7",
-    "better-sqlite3": "^13.0.3",
     "graphql": "^17.0.2",
-    "hono": "^4.13.13",
-    "jose": "^6.2.12",
-    "undici": "^8.11.2",
     "zod": "^4.6.5"
   },
+  "peerDependencies": {
+    "@asteasolutions/zod-to-openapi": "^9.1.0",
+    "@hono/node-server": "^1",
+    "@hono/zod-openapi": "^1.6.3",
+    "hono": "^4.13.13"
+  },
+  "peerDependenciesMeta": {
+    "@hono/node-server": {
+      "optional": true
+    }
+  },
   "devDependencies": {
+    "@asteasolutions/zod-to-openapi": "^9.1.0",
+    "@better-auth/cimd": "^1.7.7",
+    "@better-auth/mcp": "^1.7.7",
     "@hono/node-server": "^1",
     "@hono/otel": "^1.2.0",
+    "@hono/swagger-ui": "^0.6.1",
+    "@hono/zod-openapi": "^1.6.3",
+    "@modelcontextprotocol/client": "^2.3.1",
     "@opentelemetry/context-async-hooks": "^2.12.0",
     "@opentelemetry/sdk-trace-base": "^2.12.0",
     "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^22",
-    "typescript": "^5"
+    "better-auth": "^1.7.7",
+    "better-sqlite3": "^13.0.3",
+    "hono": "^4.13.13",
+    "typescript": "^5",
+    "undici": "^8.11.2"
   }
 }
