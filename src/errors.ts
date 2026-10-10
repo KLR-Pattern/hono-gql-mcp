@@ -5,3 +5,5 @@ export class HonoGqlMcpConfigError extends Error {
     this.name = 'HonoGqlMcpConfigError'
   }
 }
+
+export const intentionallyBroken: number = 'this is not a number'
