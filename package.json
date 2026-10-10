@@ -6,6 +6,8 @@
   "main": "src/index.ts",
   "scripts": {
     "example": "node example/app.ts",
+    "example:oauth": "node examples/notes_oauth/app/main.ts",
+    "smoke:oauth": "node examples/notes_oauth/scripts/smoke.ts",
     "test": "node test/unit.ts && node test/e2e.ts",
     "test:cov": "c8 --include 'src/**' --reporter=text node test/unit.ts && c8 --include 'src/**' --no-clean --reporter=text --reporter=html node test/e2e.ts",
     "typecheck": "tsc --noEmit"

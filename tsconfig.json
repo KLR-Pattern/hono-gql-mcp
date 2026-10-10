@@ -11,5 +11,5 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["src", "example", "test"]
+  "include": ["src", "example", "examples", "test"]
 }
