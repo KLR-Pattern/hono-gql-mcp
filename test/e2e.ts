@@ -12,11 +12,10 @@ import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/cli
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
 import type { Hono } from 'hono'
 import { createApp } from '../example/app.ts'
-import { bridgeValidator, HonoGqlMcp, LruCache, RouterGraphQLHandler } from '../src/index.ts'
+import { bridgeValidator, DuplicateFieldError, HonoGqlMcp, RouterGraphQLHandler } from '../src/index.ts'
+import { runAll, test } from './runner.ts'
 
 const AUTH = { authorization: 'Bearer demo-secret' }
-const tests: Array<[name: string, fn: () => void | Promise<void>]> = []
-const test = (name: string, fn: () => void | Promise<void>) => tests.push([name, fn])
 
 /** graphql-js types query data as a loose map — tests read it as any. */
 const d = (r: { data?: unknown }): any => r.data
@@ -203,6 +202,44 @@ test('MCP: graphql_query refuses mutation documents, and nothing executes', asyn
   await transport.close()
 })
 
+test('MCP: graphql_mutation refuses non-mutation documents, and nothing executes', async () => {
+  const { client, transport } = await mcpClient(AUTH)
+  const result = (await client.callTool({
+    name: 'graphql_mutation',
+    arguments: { query: `{ notes { list_notes { id } } }` },
+  })) as { isError?: boolean; content: Array<{ type: string; text: string }> }
+  assert.equal(result.isError, true)
+  assert.ok(result.content[0].text.includes('only runs mutation documents'), result.content[0].text)
+  await client.close()
+  await transport.close()
+})
+
+// -- passthrough -------------------------------------------------------------------
+
+test('passthrough: whitelisted cookie header reaches the route; unlisted headers never do', async () => {
+  const app = new OpenAPIHono()
+  app.openapi(
+    {
+      method: 'get',
+      path: '/who',
+      tags: ['session'],
+      operationId: 'who',
+      responses: { 200: okResponse(z.object({ session: z.string(), agent: z.string() })) },
+    } as Parameters<typeof createRoute>[0],
+    (c) =>
+      c.json(
+        { session: c.req.header('cookie') ?? 'none', agent: c.req.header('user-agent') ?? 'none' },
+        200,
+      ),
+  )
+  const h = new RouterGraphQLHandler(app, { passthroughHeaders: ['cookie'] })
+  const seen = await h.execute(`{ session { who { session agent } } }`, undefined, {
+    headers: { cookie: 'sid=abc', 'user-agent': 'curl/8' },
+  })
+  assert.equal(d(seen).session.who.session, 'sid=abc', 'whitelisted cookie rides through')
+  assert.equal(d(seen).session.who.agent, 'none', 'unlisted headers are dropped at the bridge')
+})
+
 // -- hardening -------------------------------------------------------------------
 
 /** A dedicated app: a counting slow route (measures real in-flight concurrency) + an instant route. */
@@ -283,21 +320,6 @@ test('hardening: max_depth rejects runaway nesting before anything executes', as
   const unlimited = new RouterGraphQLHandler(app, { maxDepth: null, allowMutation: true })
   const ok = await unlimited.execute(deep, undefined, { headers: AUTH })
   assert.equal(ok.errors, undefined)
-})
-
-test('hardening: LruCache — recency refresh, capacity bound, 0 disables', () => {
-  const lru = new LruCache<string>(2)
-  lru.set('a', '1')
-  lru.set('b', '2')
-  assert.equal(lru.get('a'), '1') // refresh a
-  lru.set('c', '3') // evicts b (least recent)
-  assert.equal(lru.size, 2)
-  assert.equal(lru.get('a'), '1')
-  assert.equal(lru.get('b'), undefined)
-
-  const off = new LruCache<string>(0)
-  off.set('a', '1')
-  assert.equal(off.get('a'), undefined)
 })
 
 test('hardening: document cache caches the front half — execution stays live', async () => {
@@ -530,6 +552,15 @@ test('progressive: nested domain fragment re-wraps the real group types', async 
   assert.ok(sdl.includes('type Category'), 'reachable types are collected')
   assert.ok(!sdl.includes('list_notes'), 'sibling domains stay out')
 
+  // list_mutations walks the write side of the same tree.
+  const muts = envelope(await callToolText(client, 'list_mutations', { domain: 'notes' }))
+  assert.equal(muts.success, true)
+  const names = muts.data.mutations.map((m: any) => m.name)
+  assert.ok(names.includes('create_note'), JSON.stringify(names))
+  assert.ok(names.includes('delete_note'), JSON.stringify(names))
+  const unknownMut = envelope(await callToolText(client, 'list_mutations', { domain: 'nope' }))
+  assert.equal(unknownMut.error_type, 'DOMAIN_NOT_FOUND')
+
   await client.close()
   await transport.close()
 })
@@ -561,7 +592,7 @@ test('DuplicateFieldError fires at construction, not at first query', () => {
       (c) => c.json({ v: path }, 200),
     )
   }
-  assert.throws(() => new RouterGraphQLHandler(app), /DuplicateFieldError/)
+  assert.throws(() => new RouterGraphQLHandler(app), DuplicateFieldError)
 })
 
 test('config: invalid mode throws HonoGqlMcpConfigError', () => {
@@ -1042,15 +1073,4 @@ test('zValidator style: form target and wildcard paths are skipped; filters appl
 })
 
 // -- runner ----------------------------------------------------------------------
-let failed = 0
-for (const [name, fn] of tests) {
-  try {
-    await fn()
-    console.log(`  ✓ ${name}`)
-  } catch (err) {
-    failed++
-    console.error(`  ✗ ${name}\n    ${err instanceof Error ? err.message : err}`)
-  }
-}
-console.log(failed === 0 ? `\nAll ${tests.length} checks passed.` : `\n${failed}/${tests.length} checks FAILED.`)
-process.exit(failed === 0 ? 0 : 1)
+await runAll('e2e')

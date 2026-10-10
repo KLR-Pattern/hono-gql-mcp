@@ -110,7 +110,7 @@ DuplicateFieldError are startup facts, not first-query surprises):
 | Structured | typed 2xx JSON response schema | field-selectable type |
 | Boolean success | `z.void()` response, or a 2xx with no content (204-style) | `true` on 2xx, errors surface as field errors |
 | Raw JSON | 2xx without a JSON schema, `z.record`/`z.union`/`z.literal`/`z.any` shapes | `JSON` scalar — still callable, no per-field selection; startup notice names the cause |
-| Skipped | non-JSON body, param/query/body argument name collision, write verb with `allowMutation=false`, write route outside `mutationInclude` | `handler.readiness().skips` records `{ method, path, reason }` |
+| Skipped | non-JSON body, required header/cookie parameter (it cannot be a GraphQL argument — caller credentials ride `passthroughHeaders`), param/query/body argument name collision, write verb with `allowMutation=false`, write route outside `mutationInclude` | `handler.readiness().skips` records `{ method, path, reason }` |
 
 Leaf fields are always nullable: a failing route nulls only its own field (a
 NonNull leaf would propagate the error to its whole domain group).
@@ -187,7 +187,10 @@ new HonoGqlMcp(app, {
 ```
 
 Invalid configuration throws `HonoGqlMcpConfigError` before anything is
-derived. `bridge.handler` exposes the plain face:
+derived — including the hardening knobs (`maxConcurrency: 0` would deadlock
+every call behind a never-granted permit; `requestTimeoutMs: 0` would abort
+every call instantly). Two routes sharing an operationId in one domain throw
+`DuplicateFieldError` at construction. `bridge.handler` exposes the plain face:
 `getSDL()`, `execute(query, variables, { headers, operationName })`,
 `readiness()`, `skips`, `registry`, `queryFields`/`mutationFields`,
 `routes`, `resolvedMode`.
@@ -326,7 +329,16 @@ Two implementation notes (both regression-tested):
 
 ## Verified (PoC, 2026-10-10)
 
-`npm test` — 50 end-to-end checks, all passing (plain `node`, type-stripping mode):
+`npm test` — 69 checks (18 unit + 51 end-to-end), all passing; `npm run test:cov` —
+**97.6% line / 86.6% branch coverage** over `src/` (c8, Istanbul rules).
+Plain `node`, type-stripping mode:
+
+- unit level: fnmatch globs (incl. `[seq]` / `[!seq]` character classes),
+  `documentDepth` with fragments / inline fragments / cycles, `LruCache`,
+  domain grouping (incl. the `general` fallback), the Zod mapper's enum paths
+  (legal and illegal member names, name-reuse suffixes, int detection,
+  union/literal/any → JSON), option validation for every hardening knob, and
+  the required header/cookie skip rule
 
 - composition across 3 domains (nested tag included); field selection;
   partial failure (a 404 route nulls only itself, siblings survive)
@@ -371,6 +383,9 @@ Two implementation notes (both regression-tested):
   DuplicateFieldError), typed args flowing, callable end to end; no
   responseSchema → the raw-JSON bucket with a notice (not a skip); form
   targets and wildcard paths dropped; tag/path filters apply
+- `graphql_mutation` refusing non-mutation documents (symmetric with the
+  `graphql_query` refusal); `list_mutations` in the progressive walkthrough;
+  cookie passthrough (whitelisted header rides, unlisted headers never do)
 - plus a real-socket smoke test: REST 401/200, MCP initialize → tools/list →
   tools/call with and without credentials, `/graphql` + `/graphiql`
 
@@ -391,11 +406,14 @@ Stack: hono 4.13 · @hono/zod-openapi 1.6 (Zod v4 only) · graphql-js 17 ·
 
 ```bash
 npm install
-npm test          # 50 e2e checks (plain node — type stripping, no bundler)
+npm test          # 18 unit + 51 e2e checks (plain node — type stripping, no bundler)
+npm run test:cov  # the same under c8 — line/branch coverage for src/
 npm run example   # notes demo on :8100 — REST + /mcp + /mcp-secure (gated) + /graphql + /graphiql
 HONO_GQL_MCP_OTEL=1 npm run example   # + route spans under graphql.execute
 npm run typecheck
 ```
+
+CI runs the same three on every push/PR (`.github/workflows/ci.yml`).
 
 The runner is plain `node` (Node ≥ 22.18 strips types natively), not tsx —
 a bundler-style resolver loads two `@opentelemetry/api` instances from its

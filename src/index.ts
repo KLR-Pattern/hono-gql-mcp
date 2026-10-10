@@ -28,7 +28,7 @@ import { resolveAuth, type AuthDiscoveryOptions, type AuthOptions, type Resolved
 import { HonoGqlMcpConfigError } from './errors.ts'
 import type { ScanFilters } from './scanner.ts'
 
-export { HonoGqlMcpConfigError } from './errors.ts'
+export { HonoGqlMcpConfigError, DuplicateFieldError } from './errors.ts'
 
 export interface BridgeOptions extends ScanFilters {
   /** MCP server name (shows in tool listings). Default 'hono-app'. */

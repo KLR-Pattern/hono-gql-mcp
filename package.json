@@ -6,7 +6,8 @@
   "main": "src/index.ts",
   "scripts": {
     "example": "node example/app.ts",
-    "test": "node test/e2e.ts",
+    "test": "node test/unit.ts && node test/e2e.ts",
+    "test:cov": "c8 --include 'src/**' --reporter=text node test/unit.ts && c8 --include 'src/**' --no-clean --reporter=text --reporter=html node test/e2e.ts",
     "typecheck": "tsc --noEmit"
   },
   "engines": {
@@ -32,6 +33,7 @@
     "@opentelemetry/context-async-hooks": "^2.12.0",
     "@opentelemetry/sdk-trace-base": "^2.12.0",
     "@types/node": "^22",
+    "c8": "^12.0.0",
     "typescript": "^5"
   }
 }

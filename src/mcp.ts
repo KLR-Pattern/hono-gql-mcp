@@ -174,6 +174,12 @@ const unknownDomain = (handler: RouterGraphQLHandler, domain: string): Envelope 
 }
 
 export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOptions): McpHttpHandler {
+  // The schema is immutable after build, so each domain's SDL fragment is
+  // computed once per handler and reused across requests. The SDK factory
+  // below runs PER REQUEST (stateless serving) — this cache must live
+  // outside it, or every get_query_schema would rebuild and re-print the
+  // fragment from scratch.
+  const sdlCache = new Map<string, string>()
   return createMcpHandler((ctx) => {
     // Per-request: the caller's headers, captured here and passed down as
     // the GraphQL context — resolvers forward them through the whitelist.
@@ -226,9 +232,8 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
         async () => ({ content: [{ type: 'text', text: text(handler.getSDL()) }] }),
       )
     } else {
-      // Progressive disclosure: the schema is immutable after build, so each
-      // domain's SDL fragment is computed once and reused.
-      const sdlCache = new Map<string, string>()
+      // Progressive disclosure (domain SDL fragments served from the
+      // handler-level sdlCache above).
       const resolve = (domain: string): string[] | null => {
         const path = parseDomain(domain)
         return handler.registry.has(path) ? path : null

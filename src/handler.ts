@@ -40,6 +40,7 @@ import { RouteExecutor } from './executor.ts'
 import { LruCache } from './lru.ts'
 import type { DomainRegistry } from './domains.ts'
 import { withExecuteSpan } from './otel.ts'
+import { HonoGqlMcpConfigError } from './errors.ts'
 
 export interface HandlerOptions extends ScanFilters {
   allowMutation?: boolean
@@ -68,6 +69,32 @@ export interface ReadinessReport {
 /** `null` means "off" and must survive the default — only `undefined` takes the default. */
 function withDefault<T>(value: T | undefined, fallback: T): T {
   return value === undefined ? fallback : value
+}
+
+/**
+ * Hardening knobs are validated like every other option — invalid values
+ * fail fast instead of degrading silently (maxConcurrency: 0 would deadlock
+ * every route call behind a semaphore that never grants a permit;
+ * requestTimeoutMs: 0 would abort every call instantly).
+ */
+function resolveHardening(opts: HandlerOptions): Required<Pick<HandlerOptions, 'requestTimeoutMs' | 'maxConcurrency' | 'maxDepth' | 'documentCacheSize'>> {
+  const requestTimeoutMs = withDefault(opts.requestTimeoutMs, 30_000)
+  const maxConcurrency = withDefault(opts.maxConcurrency, 16)
+  const maxDepth = withDefault(opts.maxDepth, 10)
+  const documentCacheSize = withDefault(opts.documentCacheSize, 128)
+  for (const [name, value] of [
+    ['requestTimeoutMs', requestTimeoutMs],
+    ['maxConcurrency', maxConcurrency],
+    ['maxDepth', maxDepth],
+  ] as Array<[string, number | null]>) {
+    if (value !== null && (!Number.isInteger(value) || value < 1)) {
+      throw new HonoGqlMcpConfigError(`${name} must be a positive integer or null (off), got ${value}`)
+    }
+  }
+  if (!Number.isInteger(documentCacheSize) || documentCacheSize < 0) {
+    throw new HonoGqlMcpConfigError(`documentCacheSize must be a non-negative integer (0 disables), got ${documentCacheSize}`)
+  }
+  return { requestTimeoutMs, maxConcurrency, maxDepth, documentCacheSize }
 }
 
 interface FrontHalf {
@@ -132,9 +159,10 @@ export class RouterGraphQLHandler {
     // Two introspection sources: the zod-openapi registry, and Hono's own
     // route table for bridgeValidator middleware (same filters on both).
     this.routes = [...scanRoutes(app.openAPIRegistry, opts), ...scanValidatorRoutes(app, opts)]
+    const hardening = resolveHardening(opts)
     const executor = new RouteExecutor(app as never, opts.passthroughHeaders ?? ['authorization'], {
-      requestTimeoutMs: withDefault(opts.requestTimeoutMs, 30_000),
-      maxConcurrency: withDefault(opts.maxConcurrency, 16),
+      requestTimeoutMs: hardening.requestTimeoutMs,
+      maxConcurrency: hardening.maxConcurrency,
     })
     const built = buildSchema(this.routes, executor, {
       allowMutation: opts.allowMutation ?? false,
@@ -149,8 +177,8 @@ export class RouterGraphQLHandler {
     this.mutationFields = built.mutationFields
     this.routeCount = built.routeCount
     this.domains = built.domains
-    this.#maxDepth = withDefault(opts.maxDepth, 10)
-    this.#cache = new LruCache<FrontHalf>(withDefault(opts.documentCacheSize, 128))
+    this.#maxDepth = hardening.maxDepth
+    this.#cache = new LruCache<FrontHalf>(hardening.documentCacheSize)
   }
 
   getSDL(): string {

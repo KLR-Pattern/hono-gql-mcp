@@ -34,6 +34,7 @@ import { jsonBodySchemaOf, type RouteInfo } from './scanner.ts'
 import type { RouteExecutor } from './executor.ts'
 import { DomainRegistry, domainsFor, type DomainEntry } from './domains.ts'
 import { fnmatchToRegExp } from './fnmatch.ts'
+import { DuplicateFieldError } from './errors.ts'
 
 export interface SkipRecord {
   method: string
@@ -114,6 +115,45 @@ function shapeOf(schema: unknown): Record<string, unknown> {
 const defType = (schema: unknown): string | undefined =>
   (schema as { def?: { type?: string } } | undefined)?.def?.type
 
+/** True when the schema accepts absence — an optional/default anywhere in the wrapper chain. */
+function isOptionalSchema(schema: unknown): boolean {
+  let cur: unknown = schema
+  for (let depth = 0; depth < 64 && cur; depth++) {
+    const def = (cur as { def?: Record<string, any> }).def
+    if (!def) return false
+    if (def.type === 'optional' || def.type === 'default') return true
+    cur = def.type === 'pipe' ? def.in : def.type === 'lazy' ? def.getter?.() : undefined
+  }
+  return false
+}
+
+/**
+ * Python-bridge parity: a REQUIRED header/cookie parameter cannot become a
+ * GraphQL argument, so the field could never be called correctly — skip with
+ * a reason instead of deriving a broken field. Optional ones stay callable
+ * (caller credentials ride passthroughHeaders, not GraphQL arguments).
+ */
+function requiredHeaderCookieReason(route: RouteConfig): string | null {
+  const locations: Array<[string, unknown]> = [
+    ['header', route.request?.headers],
+    ['cookie', route.request?.cookies],
+  ]
+  for (const [kind, schema] of locations) {
+    if (!schema) continue
+    const names = Array.isArray(schema) ? schema.map((_, i) => `#${i}`) : Object.keys(shapeOf(schema))
+    const subs = Array.isArray(schema) ? schema : Object.values(shapeOf(schema))
+    for (const [i, name] of names.entries()) {
+      if (!isOptionalSchema(subs[i])) {
+        return (
+          `required ${kind} parameter '${name}' cannot be a GraphQL argument — ` +
+          'make it optional (caller credentials ride passthroughHeaders instead of GraphQL arguments)'
+        )
+      }
+    }
+  }
+  return null
+}
+
 /** A NonNull leaf would null its whole domain group on a single route error — unwrap. */
 function nullableLeaf(t: GraphQLOutputType): GraphQLOutputType {
   return t instanceof GraphQLNonNull ? t.ofType : t
@@ -143,6 +183,12 @@ export function buildSchema(routes: RouteInfo[], executor: RouteExecutor, opts: 
     const bodySchema = jsonBodySchemaOf(route)
     if (route.request?.body && !bodySchema) {
       skip('non-JSON request body — MCP tool arguments are JSON, the protocol has no file channel')
+      continue
+    }
+
+    const headerCookieReason = requiredHeaderCookieReason(route)
+    if (headerCookieReason) {
+      skip(headerCookieReason)
       continue
     }
 
@@ -275,8 +321,8 @@ export function buildSchema(routes: RouteInfo[], executor: RouteExecutor, opts: 
           const dupKey = `${kind}|${leafDomain.join(':')}|${leaf.fieldName}`
           const existing = seenFields.get(dupKey)
           if (existing) {
-            throw new Error(
-              `DuplicateFieldError: '${leaf.fieldName}' in domain '${leafDomain.join(':')}' ` +
+            throw new DuplicateFieldError(
+              `'${leaf.fieldName}' in domain '${leafDomain.join(':')}' ` +
                 `(already used by ${existing}). Give the routes distinct operationId values.`,
             )
           }
