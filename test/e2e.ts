@@ -8,13 +8,20 @@
  * end-to-end credential passthrough.
  */
 import assert from 'node:assert/strict'
+import { rmSync } from 'node:fs'
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client'
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
 import type { Hono } from 'hono'
-import { createApp } from '../example/app.ts'
+import { DB_PATH, DEMO_OWNER } from '../example/store.ts'
+
+// Verify isolation BEFORE loading the app: SQLITE_PATH points at test/.tmp/…
+// (test/e2e.env), and the file is cleared so counts are exact per run.
+// A body of accumulated state used to push a fresh row out of a 10-item window.
+for (const suffix of ['', '-wal', '-shm']) rmSync(`${DB_PATH}${suffix}`, { force: true })
+
+const { createApp } = await import('../example/app.ts')
 import { bridgeValidator, HonoGqlMcp, LruCache, RouterGraphQLHandler } from '../src/index.ts'
 
-const AUTH = { authorization: 'Bearer demo-secret' }
 const tests: Array<[name: string, fn: () => void | Promise<void>]> = []
 const test = (name: string, fn: () => void | Promise<void>) => tests.push([name, fn])
 
@@ -22,8 +29,17 @@ const test = (name: string, fn: () => void | Promise<void>) => tests.push([name,
 const d = (r: { data?: unknown }): any => r.data
 
 // -- shared fixtures ------------------------------------------------------------
-const { app, bridge } = createApp()
+const { app, bridge, auth, store } = await createApp()
 const handler = bridge.handler
+
+/**
+ * The example app authenticates every note route, so every request needs a
+ * real Bearer. Tests mint one with the app's own auth instance (no GitHub
+ * round trip) — the mirror of the Python example's smoke script. `DEMO_OWNER`
+ * makes the seeded notes visible.
+ */
+const signToken = auth.signToken
+const AUTH = { authorization: `Bearer ${await signToken(DEMO_OWNER)}` }
 const gql = (query: string, headers: Record<string, string> = AUTH) =>
   handler.execute(query, undefined, { headers })
 
@@ -152,7 +168,14 @@ test('MCP: graphql_query composes domains in one tool call', async () => {
 })
 
 test('MCP: per-caller credentials reach the routes end-to-end', async () => {
-  const { client, transport } = await mcpClient({}) // no credentials
+  // The example's /mcp is OAuth-gated, so mount a second, UNgated bridge to
+  // isolate the route-level check: with no credentials the passthrough
+  // delivers nothing and the routes answer 401 — proving the bridge holds no
+  // credentials of its own.
+  const fresh = await createApp()
+  const open = new HonoGqlMcp(fresh.app, { name: 'open', allowMutation: true })
+  open.mountTo(fresh.app, '/mcp-open')
+  const { client, transport } = await mcpClient({}, fresh.app, '/mcp-open')
   const raw = await callToolText(client, 'graphql_query', {
     query: `{ notes { list_notes { id } } }`,
   })
@@ -167,9 +190,12 @@ test('MCP: per-caller credentials reach the routes end-to-end', async () => {
 
 test('MCP: graphql_mutation writes, then the write is visible', async () => {
   const { client, transport } = await mcpClient(AUTH)
+  // Unique tag per run: the store is PERSISTENT now, so a fixed fixture would
+  // collide with rows left by earlier runs.
+  const tag = `mcp-${Date.now()}`
   const created = JSON.parse(
     await callToolText(client, 'graphql_mutation', {
-      query: `mutation { notes { create_note(body: { title: "from MCP", tags: ["mcp"] }) { id title } } }`,
+      query: `mutation { notes { create_note(body: { title: "from MCP", tags: ["${tag}"] }) { id title } } }`,
     }),
   )
   assert.equal(created.errors, undefined)
@@ -177,7 +203,7 @@ test('MCP: graphql_mutation writes, then the write is visible', async () => {
 
   const listed = JSON.parse(
     await callToolText(client, 'graphql_query', {
-      query: `{ notes { list_notes(tag: "mcp") { title } } }`,
+      query: `{ notes { list_notes(tag: "${tag}") { title } } }`,
     }),
   )
   assert.deepEqual(listed.data.notes.list_notes, [{ title: 'from MCP' }])
@@ -277,12 +303,28 @@ test('hardening: queue waits count against requestTimeoutMs', async () => {
 test('hardening: max_depth rejects runaway nesting before anything executes', async () => {
   // Category recursion makes selectable depth unbounded — 13 levels.
   const deep = `{ catalog { tree { categories { ${'children { '.repeat(11)}name ${'} '.repeat(11)} } } } }`
+  // The default handler (maxDepth 10) rejects the document before execution.
   const limited = await handler.execute(deep, undefined, { headers: AUTH })
   assert.ok(limited.errors?.some((e) => e.message.includes('max_depth')), JSON.stringify(limited.errors))
 
   const unlimited = new RouterGraphQLHandler(app, { maxDepth: null, allowMutation: true })
   const ok = await unlimited.execute(deep, undefined, { headers: AUTH })
   assert.equal(ok.errors, undefined)
+})
+
+test('hardening: introspection is exempt from max_depth (GraphiQL/codegen work at the default)', async () => {
+  // The canonical client introspection query nests ~16 through `ofType` — past
+  // maxDepth's default of 10. Without the exemption every tool that reads the
+  // schema (GraphiQL first among them) fails at the default.
+  const introspection = `query IntrospectionQuery { __schema { queryType { name } types { ...FullType } } }
+    fragment FullType on __Type { kind name fields(includeDeprecated: true) { name type { ...TypeRef } } }
+    fragment TypeRef on __Type { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name ofType { kind name } } } } } } } }`
+  const result = await handler.execute(introspection, undefined, { headers: AUTH })
+  assert.equal(result.errors, undefined, JSON.stringify(result.errors))
+  assert.ok((d(result).__schema?.types?.length ?? 0) > 0, 'schema types returned at the default depth')
+  // `__type` (single-type shorthand) is exempt too.
+  const oneType = `{ __type(name: "Note") { kind name ofType { kind name } } }`
+  assert.equal((await handler.execute(oneType, undefined, { headers: AUTH })).errors, undefined)
 })
 
 test('hardening: LruCache — recency refresh, capacity bound, 0 disables', () => {
@@ -302,15 +344,18 @@ test('hardening: LruCache — recency refresh, capacity bound, 0 disables', () =
 
 test('hardening: document cache caches the front half — execution stays live', async () => {
   const h = new RouterGraphQLHandler(app, { allowMutation: true })
-  const q = `{ notes { list_notes { id title } } }`
-  const before = await h.execute(q, undefined, { headers: AUTH })
+  // Unique title marker: the store persists, and sibling tests write notes too —
+  // count deltas are only deterministic scoped to this test's own row.
+  const marker = `cache-check-${Date.now()}`
+  const q = (t: string) => `{ notes { get_search(q: "${t}") { title } } }`
+  const before = await h.execute(q(marker), undefined, { headers: AUTH })
   await h.execute(
-    `mutation { notes { create_note(body: { title: "cache-check" }) { id } } }`,
+    `mutation { notes { create_note(body: { title: "${marker}" }) { id } } }`,
     undefined,
     { headers: AUTH },
   )
-  const after = await h.execute(q, undefined, { headers: AUTH }) // same document — cache hit on parse/validate
-  assert.equal(d(after).notes.list_notes.length, d(before).notes.list_notes.length + 1)
+  const after = await h.execute(q(marker), undefined, { headers: AUTH }) // same document — cache hit on parse/validate
+  assert.equal(d(after).notes.get_search.length, d(before).notes.get_search.length + 1)
 })
 
 // -- route filters + multi-domain ---------------------------------------------------
@@ -442,11 +487,12 @@ function bigApp() {
 
 const envelope = (raw: string): any => JSON.parse(raw)
 
-test('progressive: mode=auto switches above the threshold', () => {
+test('progressive: mode=auto switches above the threshold', async () => {
   assert.equal(new HonoGqlMcp(bigApp()).resolvedMode, 'progressive')
   assert.equal(new HonoGqlMcp(bigApp(), { progressiveThreshold: 35 }).resolvedMode, 'simple')
   assert.equal(new HonoGqlMcp(bigApp(), { mode: 'simple' }).resolvedMode, 'simple')
-  assert.equal(new HonoGqlMcp(createApp().app, { allowMutation: true, progressiveThreshold: 5 }).resolvedMode, 'progressive')
+  const { app } = await createApp()
+  assert.equal(new HonoGqlMcp(app, { allowMutation: true, progressiveThreshold: 5 }).resolvedMode, 'progressive')
 })
 
 test('progressive: constant 4-tool catalog (no get_schema), full walkthrough works', async () => {
@@ -509,7 +555,7 @@ test('progressive: constant 4-tool catalog (no get_schema), full walkthrough wor
 test('progressive: nested domain fragment re-wraps the real group types', async () => {
   // The example app carries tag 'catalog:tree' — force progressive over it.
   // Mount at its own path: createApp()'s bridge already occupies /mcp.
-  const fresh = createApp()
+  const fresh = await createApp()
   const bridge = new HonoGqlMcp(fresh.app, {
     name: 'nested-domains',
     allowMutation: true,
@@ -564,9 +610,10 @@ test('DuplicateFieldError fires at construction, not at first query', () => {
   assert.throws(() => new RouterGraphQLHandler(app), /DuplicateFieldError/)
 })
 
-test('config: invalid mode throws HonoGqlMcpConfigError', () => {
+test('config: invalid mode throws HonoGqlMcpConfigError', async () => {
+  const { app } = await createApp()
   assert.throws(
-    () => new HonoGqlMcp(createApp().app, { mode: 'bogus' as never }),
+    () => new HonoGqlMcp(app, { mode: 'bogus' as never }),
     (e: unknown) => e instanceof Error && e.name === 'HonoGqlMcpConfigError',
   )
 })
@@ -574,11 +621,11 @@ test('config: invalid mode throws HonoGqlMcpConfigError', () => {
 // -- plain GraphQL HTTP face + GraphiQL ----------------------------------------------
 
 test('graphql face: POST executes with caller credentials, GET answers 405 usage', async () => {
-  const fresh = createApp() // createApp mounts /graphql + /graphiql itself
+  const fresh = await createApp() // createApp mounts /graphql + /graphiql itself
 
   const res = await fresh.app.request('/graphql', {
     method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: 'Bearer demo-secret' },
+    headers: { 'content-type': 'application/json', ...AUTH },
     body: JSON.stringify({ query: '{ notes { list_notes { title } } }' }),
   })
   assert.equal(res.status, 200)
@@ -604,10 +651,47 @@ test('graphql face: POST executes with caller credentials, GET answers 405 usage
   assert.ok((await html.text()).includes('GraphiQL'))
 })
 
+// -- REST docs: OpenAPI document + Swagger UI ------------------------------------------
+
+test('docs: /openapi.json derives from the same createRoute definitions, recursion ref-safe', async () => {
+  const fresh = await createApp()
+  const res = await fresh.app.request('/openapi.json')
+  assert.equal(res.status, 200)
+  const doc = (await res.json()) as {
+    openapi: string
+    paths: Record<string, unknown>
+    components?: { schemas?: Record<string, unknown> }
+  }
+  assert.ok(doc.openapi.startsWith('3.1'), doc.openapi)
+  // Every zod-openapi route appears — a subset would mean the doc silently dropped routes.
+  assert.deepEqual(
+    Object.keys(doc.paths).sort(),
+    ['/categories', '/notes', '/notes/{id}', '/stats'],
+  )
+  // The recursive Category schema is emitted as a $ref, not inlined forever —
+  // the bug that made getOpenAPIDocument() blow the stack before `id` was set.
+  const cat = JSON.stringify(doc.components?.schemas?.Category)
+  assert.ok(cat.includes('"$ref":"#/components/schemas/Category"'), cat)
+
+  // Swagger UI is mounted and points at the document.
+  const ui = await fresh.app.request('/docs')
+  assert.equal(ui.status, 200)
+  const html = await ui.text()
+  assert.ok(html.includes('swagger-ui'), 'swagger assets')
+  assert.ok(html.includes('/openapi.json'), 'document url wired')
+})
+
+test('docs: /docs and /openapi.json are public; business routes stay gated', async () => {
+  const fresh = await createApp()
+  assert.equal((await fresh.app.request('/openapi.json')).status, 200)
+  assert.equal((await fresh.app.request('/docs')).status, 200)
+  assert.equal((await fresh.app.request('/notes')).status, 401, 'still gated')
+})
+
 // -- response limiting + rate limiting + run() -----------------------------------------
 
 test('maxResponseChars truncates oversized tool results with a marker', async () => {
-  const fresh = createApp()
+  const fresh = await createApp()
   const capped = new HonoGqlMcp(fresh.app, { name: 'capped', allowMutation: true, maxResponseChars: 150 })
   capped.mountTo(fresh.app, '/mcp-capped')
   const { client, transport } = await mcpClient(AUTH, fresh.app, '/mcp-capped')
@@ -623,7 +707,7 @@ test('maxResponseChars truncates oversized tool results with a marker', async ()
 })
 
 test('rateLimit: rapid requests above the budget get 429', async () => {
-  const fresh = createApp()
+  const fresh = await createApp()
   const limited = new HonoGqlMcp(fresh.app, { name: 'limited', rateLimit: { maxPerSecond: 2 } })
   limited.mountTo(fresh.app, '/mcp-limited')
 
@@ -651,7 +735,7 @@ test('rateLimit: rapid requests above the budget get 429', async () => {
 })
 
 test('run(): standalone MCP server on its own port', async () => {
-  const fresh = createApp()
+  const fresh = await createApp()
   const runner = new HonoGqlMcp(fresh.app, { name: 'standalone' })
   const server = await runner.run({ port: 8199 })
   try {
@@ -696,19 +780,23 @@ const postTo = (target: Hono<any, any, any>, path: string, headers: Record<strin
   )
 
 test('auth gate: no/bad token → 401 with a WWW-Authenticate Bearer challenge', async () => {
-  const fresh = createApp() // /mcp-secure is gated by sharedSecret = demo-secret
-  const no = await postTo(fresh.app, '/mcp-secure')
+  const fresh = await createApp() // the example /mcp is gated by better-auth's verifier
+  const no = await postTo(fresh.app, '/mcp')
   assert.equal(no.status, 401)
   assert.ok(no.headers.get('www-authenticate')?.startsWith('Bearer'), 'challenge header')
+  assert.ok(
+    no.headers.get('www-authenticate')?.includes('resource_metadata='),
+    'challenge carries the discovery pointer (RFC 9728)',
+  )
 
-  const bad = await postTo(fresh.app, '/mcp-secure', { authorization: 'Bearer wrong' })
+  const bad = await postTo(fresh.app, '/mcp', { authorization: 'Bearer wrong' })
   assert.equal(bad.status, 401)
   assert.ok(bad.headers.get('www-authenticate')?.includes('invalid_token'))
 })
 
-test('auth gate: sharedSecret full MCP round trip — one token passes both checks', async () => {
-  const fresh = createApp()
-  const { client, transport } = await mcpClient(AUTH, fresh.app, '/mcp-secure')
+test('auth gate: a real token passes both checks — one Bearer, endpoint and routes', async () => {
+  const fresh = await createApp()
+  const { client, transport } = await mcpClient(AUTH, fresh.app, '/mcp')
   const { tools } = await client.listTools()
   assert.equal(tools.length, 3)
   const raw = await callToolText(client, 'graphql_query', {
@@ -719,8 +807,31 @@ test('auth gate: sharedSecret full MCP round trip — one token passes both chec
   await transport.close()
 })
 
+test('isolation: one user never sees another user\'s notes', async () => {
+  const fresh = await createApp()
+  const alice = { authorization: `Bearer ${await signToken('user-alice')}` }
+  const bob = { authorization: `Bearer ${await signToken('user-bob')}` }
+
+  // Alice creates a note.
+  const created = await fresh.app.request('/notes', {
+    method: 'POST',
+    headers: { ...alice, 'content-type': 'application/json' },
+    body: JSON.stringify({ title: 'alice-secret', tags: [] }),
+  })
+  assert.equal(created.status, 201)
+  const noteId = ((await created.json()) as { id: string }).id
+
+  // Alice sees it; Bob does not — not in his list, and a direct fetch is 404.
+  const aliceList = (await (await fresh.app.request('/notes', { headers: alice })).json()) as Array<{ id: string }>
+  assert.ok(aliceList.some((n) => n.id === noteId))
+  const bobList = (await (await fresh.app.request('/notes', { headers: bob })).json()) as Array<{ id: string }>
+  assert.ok(!bobList.some((n) => n.id === noteId), 'bob must not see alice\'s note')
+  const bobGet = await fresh.app.request(`/notes/${noteId}`, { headers: bob })
+  assert.equal(bobGet.status, 404, 'someone else\'s note does not exist for you')
+})
+
 test('auth gate: independent of route auth — gate token ≠ route token → HTTP_401 field errors', async () => {
-  const fresh = createApp()
+  const fresh = await createApp()
   const gated = new HonoGqlMcp(fresh.app, {
     name: 'independent-gate',
     auth: {
@@ -744,7 +855,7 @@ test('auth gate: independent of route auth — gate token ≠ route token → HT
 })
 
 test('auth gate: verifyToken returning null refuses with 401', async () => {
-  const fresh = createApp()
+  const fresh = await createApp()
   const gated = new HonoGqlMcp(fresh.app, { name: 'null-gate', auth: { verifyToken: () => null } })
   gated.mountTo(fresh.app, '/mcp-null')
   const res = await postTo(fresh.app, '/mcp-null', { authorization: 'Bearer anything' })
@@ -753,7 +864,7 @@ test('auth gate: verifyToken returning null refuses with 401', async () => {
 })
 
 test('auth gate: requiredScopes — missing scope → 403 with a scope hint', async () => {
-  const fresh = createApp()
+  const fresh = await createApp()
   const authInfo = (scopes: string[]) => ({ token: 't', clientId: 'c', scopes, expiresAt: Math.floor(Date.now() / 1000) + 3600 })
   const gated = new HonoGqlMcp(fresh.app, {
     name: 'scope-gate',
@@ -848,8 +959,11 @@ test('auth: per-tool scopes — graphql_mutation demands notes:write (pre-dispat
 })
 
 test('auth: discovery — RFC 9728/8414 well-known routes, normal paths untouched', async () => {
-  const fresh = createApp()
-  const gated = new HonoGqlMcp(fresh.app, {
+  // A bare app, NOT createApp(): the example mounts its own
+  // /.well-known/oauth-authorization-server, and Hono serves the first match.
+  const app = new OpenAPIHono()
+  app.get('/ping', (c) => c.json({ ok: true }))
+  const gated = new HonoGqlMcp(app, {
     name: 'discovery',
     auth: {
       sharedSecret: 'demo-secret',
@@ -866,32 +980,33 @@ test('auth: discovery — RFC 9728/8414 well-known routes, normal paths untouche
       },
     },
   })
-  gated.mountTo(fresh.app, '/mcp-d')
+  gated.mountTo(app, '/mcp-d')
 
-  const prm = await fresh.app.request('/.well-known/oauth-protected-resource/mcp-d')
+  const prm = await app.request('/.well-known/oauth-protected-resource/mcp-d')
   assert.equal(prm.status, 200)
   const prmBody = (await prm.json()) as { resource: string; authorization_servers: string[]; scopes_supported: string[] }
   assert.equal(prmBody.resource, 'http://localhost:8100/mcp-d')
   assert.deepEqual(prmBody.authorization_servers, ['https://idp.example.com'])
   assert.deepEqual(prmBody.scopes_supported, ['mcp', 'notes:write'])
 
-  const as = await fresh.app.request('/.well-known/oauth-authorization-server')
+  const as = await app.request('/.well-known/oauth-authorization-server')
   assert.equal(as.status, 200)
   assert.equal(((await as.json()) as { issuer: string }).issuer, 'https://idp.example.com')
 
   // The well-known middleware falls through — regular routes unaffected.
-  const notes = await fresh.app.request('/notes', { headers: AUTH })
-  assert.equal(notes.status, 200)
+  const ping = await app.request('/ping')
+  assert.equal(ping.status, 200)
 })
 
-test('auth: config errors — verifier sources are mutually exclusive and required', () => {
+test('auth: config errors — verifier sources are mutually exclusive and required', async () => {
+  const { app } = await createApp()
   assert.throws(
-    () => new HonoGqlMcp(createApp().app, { auth: {} }),
+    () => new HonoGqlMcp(app, { auth: {} }),
     (e: unknown) => e instanceof Error && e.name === 'HonoGqlMcpConfigError',
   )
   assert.throws(
     () =>
-      new HonoGqlMcp(createApp().app, {
+      new HonoGqlMcp(app, {
         auth: { verifyToken: () => null, sharedSecret: 'x' },
       }),
     (e: unknown) => e instanceof Error && /only one/.test(e.message),
@@ -924,7 +1039,7 @@ test('otel: tools/call → graphql.execute → route span, one waterfall', async
   // The example mounts @hono/otel BEFORE its routes under HONO_GQL_MCP_OTEL=1
   // (Hono middleware registered after a handler does not wrap it).
   process.env.HONO_GQL_MCP_OTEL = '1'
-  const fresh = createApp()
+  const fresh = await createApp()
 
   const { client, transport } = await mcpClient(AUTH, fresh.app)
   await callToolText(client, 'graphql_query', {
@@ -980,6 +1095,10 @@ test('otel: route.timeout and route.queue surface as events on graphql.execute',
   const exec2 = exporter.getFinishedSpans().filter((s) => s.name === 'graphql.execute').pop()
   assert.ok(exec2?.events.some((e: { name: string }) => e.name === 'route.queue'), JSON.stringify(exec2?.events))
 })
+
+// Close the shared store when the run ends, so WAL is checkpointed and the
+// sqlite file is left clean for the next `npm test`.
+process.on('exit', () => store.close())
 
 // -- bridgeValidator: the zValidator-style route source -----------------------------
 

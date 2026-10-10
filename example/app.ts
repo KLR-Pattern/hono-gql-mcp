@@ -1,254 +1,205 @@
 /**
- * Demo app — a small notes service (notes / analytics / catalog domains,
- * bearer auth, one recursive type, one deliberately untyped field) with the
- * bridge mounted. Mirrors examples/shop of fastapi-gql-mcp.
+ * Demo app — a small notes service with GitHub login and an MCP endpoint
+ * behind OAuth 2.1, built on the Hono+Zod → GraphQL → MCP bridge.
+ * Mirrors examples/notes_oauth of fastapi-gql-mcp.
  *
- *   npm run example        # REST + MCP /mcp on :8100
+ *   npm run example        # REST + GraphQL + MCP on :8020
  *   npm test               # in-process end-to-end walkthrough
+ *
+ * One Bearer, two checks: the bridge gate verifies the ENDPOINT (401/403 with
+ * OAuth discovery), and the same token — or the session cookie — reaches the
+ * routes through per-caller passthrough, where the app verifies the BUSINESS
+ * CALL. The bridge holds no credentials of its own.
+ *
+ * createApp() is async and side-effect free at import: it opens the store, runs
+ * better-auth's migrations, and reads the AS metadata — all per call. Tests call
+ * it many times; nothing is shared through module state.
  */
 import { serve } from '@hono/node-server'
 import { pathToFileURL } from 'node:url'
-import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
+import { OpenAPIHono } from '@hono/zod-openapi'
+import { swaggerUI } from '@hono/swagger-ui'
+import type { Context, Next } from 'hono'
 import { httpInstrumentationMiddleware } from '@hono/otel'
-import { bridgeValidator, HonoGqlMcp } from '../src/index.ts'
+import { HonoGqlMcp } from '../src/index.ts'
+import { createAuth, type Auth } from './auth.ts'
+import {
+  BASE_URL,
+  BETTER_AUTH_SECRET,
+  GITHUB_CLIENT_ID,
+  GITHUB_CLIENT_SECRET,
+  MCP_RESOURCE,
+  OUTBOUND_PROXY,
+  PORT,
+  githubConfigured,
+  otelEnabled,
+  secretIsDefault,
+} from './config.ts'
+import { consentPageHtml, landingPageHtml, loginPageHtml } from './pages.ts'
+import { registerRoutes, type Env } from './routes.ts'
+import { createStore, type Store } from './store.ts'
 
-// ---- domain models — .meta({ title }) names the GraphQL type ----------------
-const Note = z
-  .object({
-    id: z.string().describe('Note id.'),
-    title: z.string().describe('Note title.'),
-    tags: z.array(z.string()).describe('Free-form tags.'),
-  })
-  .meta({ title: 'Note', description: 'A note.' })
-
-const NewNote = z
-  .object({
-    title: z.string().describe('Note title.'),
-    tags: z.array(z.string()).default([]).describe('Free-form tags.'),
-  })
-  .meta({ title: 'NewNote', description: 'Payload for creating a note.' })
-
-const Stats = z
-  .object({
-    total: z.int().describe('Total note count.'),
-    by_tag: z.record(z.string(), z.int()).describe('Note count per tag (dynamic shape → JSON).'),
-  })
-  .meta({ title: 'Stats', description: 'Service statistics.' })
-
-interface CategoryShape {
-  name: string
-  children: CategoryShape[]
+export interface CreateAppOptions {
+  /** Route-level tracing. Defaults to the HONO_GQL_MCP_OTEL env switch. */
+  otel?: boolean
 }
-const Category: z.ZodType<CategoryShape> = z
-  .object({
-    name: z.string(),
-    children: z.array(z.lazy(() => Category)),
-  })
-  .meta({
-    title: 'Category',
-    description: 'A category tree node. Selecting children repeats your selection at every level.',
-  })
 
-// ---- routes -------------------------------------------------------------------
-const TOKEN = 'demo-secret'
+export interface App {
+  app: OpenAPIHono<Env>
+  bridge: HonoGqlMcp
+  store: Store
+  auth: Auth
+}
 
-const listNotes = createRoute({
-  method: 'get',
-  path: '/notes',
-  tags: ['notes'],
-  operationId: 'list_notes',
-  summary: 'Browse notes.',
-  request: {
-    query: z.object({
-      tag: z.string().optional().describe('Filter by tag.'),
-      limit: z.coerce.number().int().min(1).max(100).default(10).describe('Page size.'),
-    }),
-  },
-  responses: {
-    200: { description: 'Notes.', content: { 'application/json': { schema: z.array(Note) } } },
-  },
-})
+/**
+ * Paths that answer without a caller. The MCP and GraphQL patterns end on a
+ * word boundary, so `/mcp`, `/mcp/1` and a sibling mount `/mcp-open` all match
+ * while `/mcpfoo` does not — a bare `/^\/mcp/` prefix would have matched it.
+ */
+const PUBLIC = [
+  /^\/$/,
+  /^\/auth\//,
+  /^\/api\/auth\//,
+  /^\/oauth2\//,
+  /^\/\.well-known\//,
+  /^\/(?:graphql|graphiql)\b/,
+  /^\/mcp\b/,
+  /^\/categories$/,
+  /^\/(?:docs|openapi\.json)$/,
+]
 
-const getNote = createRoute({
-  method: 'get',
-  path: '/notes/{id}',
-  tags: ['notes'],
-  operationId: 'get_note',
-  summary: 'Fetch one note.',
-  request: { params: z.object({ id: z.string().describe('Note id.') }) },
-  responses: {
-    200: { description: 'The note.', content: { 'application/json': { schema: Note } } },
-    404: { description: 'No such note.' },
-  },
-})
+export async function createApp(options: CreateAppOptions = {}): Promise<App> {
+  const app = new OpenAPIHono<Env>()
 
-const createNote = createRoute({
-  method: 'post',
-  path: '/notes',
-  tags: ['notes'],
-  operationId: 'create_note',
-  summary: 'Create a note.',
-  request: { body: { content: { 'application/json': { schema: NewNote } } } },
-  responses: {
-    201: { description: 'Created.', content: { 'application/json': { schema: Note } } },
-  },
-})
-
-const deleteNote = createRoute({
-  method: 'delete',
-  path: '/notes/{id}',
-  tags: ['notes'],
-  operationId: 'delete_note',
-  summary: 'Delete a note (204-style).',
-  request: { params: z.object({ id: z.string() }) },
-  responses: { 204: { description: 'Deleted.' } },
-})
-
-const stats = createRoute({
-  method: 'get',
-  path: '/stats',
-  tags: ['analytics'],
-  operationId: 'stats',
-  summary: 'Service statistics.',
-  responses: { 200: { description: 'Stats.', content: { 'application/json': { schema: Stats } } } },
-})
-
-const categories = createRoute({
-  method: 'get',
-  path: '/categories',
-  tags: ['catalog:tree'],
-  operationId: 'categories',
-  summary: 'The recursive category tree.',
-  responses: {
-    200: { description: 'Tree.', content: { 'application/json': { schema: z.array(Category) } } },
-  },
-})
-
-export function createApp() {
-  const app = new OpenAPIHono()
-
-  // Optional route-level tracing (HONO_GQL_MCP_OTEL=1): @hono/otel extracts the
-  // W3C traceparent the bridge injects into every in-process route call, so
-  // route spans nest under graphql.execute. Without a registered OTel SDK both
-  // sides are no-ops — see the README's Observability section.
-  if (process.env.HONO_GQL_MCP_OTEL === '1') {
+  // Optional route-level tracing (@hono/otel extracts the W3C traceparent the
+  // bridge injects into every in-process route call, so route spans nest under
+  // graphql.execute). Without a registered OTel SDK both sides are no-ops — see
+  // the README's Observability section. Registered FIRST: Hono middleware
+  // registered after a handler does not wrap it.
+  if (options.otel ?? otelEnabled()) {
+    // @hono/otel types its middleware against a bare Hono Env; the cast bridges
+    // that to this app's Variables without widening what the routes see.
     app.use(httpInstrumentationMiddleware({ serviceName: 'notes-api' }) as never)
   }
 
-  // ---- in-memory store (fresh per app instance) ------------------------------
-  let nextId = 4
-  const notes = new Map<string, { id: string; title: string; tags: string[] }>(
-    [
-      { id: 'n1', title: 'Buy milk', tags: ['errand'] },
-      { id: 'n2', title: 'Ship 0.1.0', tags: ['work'] },
-      { id: 'n3', title: 'Call mom', tags: ['family'] },
-    ].map((n) => [n.id, n]),
-  )
-  const categoryTree: CategoryShape[] = [
-    { name: 'docs', children: [{ name: 'guides', children: [{ name: 'quickstart', children: [] }] }] },
-    { name: 'src', children: [{ name: 'core', children: [] }] },
-  ]
+  const store = createStore()
 
-  // The ONLY credential verifier — the bridge never holds tokens of its own.
-  // The bridge's own endpoints (/mcp*, /graphql, /graphiql) and the OAuth
-  // discovery documents (/.well-known/* — public by RFC 9728 design:
-  // clients discover BEFORE authenticating) stay open; business calls are
-  // verified route-by-route via per-caller passthrough.
-  app.use('*', async (c, next) => {
-    const open = /^\/(mcp|graphql|graphiql)/.test(c.req.path) || c.req.path.startsWith('/.well-known/')
-    if (!open && c.req.header('authorization') !== `Bearer ${TOKEN}`) {
-      return c.json({ error: 'unauthorized' }, 401)
-    }
+  // better-auth: browser login + the OAuth 2.1 AS, one handler. It runs its
+  // migrations against the store's database handle — one file, one connection.
+  const auth = await createAuth({
+    baseUrl: BASE_URL,
+    secret: BETTER_AUTH_SECRET,
+    github: githubConfigured ? { clientId: GITHUB_CLIENT_ID, clientSecret: GITHUB_CLIENT_SECRET } : null,
+    mcpResource: MCP_RESOURCE,
+    outboundProxy: OUTBOUND_PROXY,
+    database: store.db,
+  })
+
+  // Everything the OAuth server needs (authorize, token, register, jwks,
+  // well-known discovery) is served under /api/auth/*. Registered FIRST so no
+  // later catch-all can shadow it.
+  app.on(['GET', 'POST'], '/api/auth/*', (c) => auth.handler(c.req.raw))
+
+  // ---- pages the OAuth server hands the browser ----------------------------
+  app.get('/', (c) => c.html(landingPageHtml(BASE_URL, githubConfigured)))
+  app.get('/auth/login', (c) => c.html(loginPageHtml(githubConfigured)))
+  app.get('/auth/consent', (c) => c.html(consentPageHtml(new URL(c.req.url).searchParams)))
+
+  // ---- auth middleware: resolve the caller, gate the business routes -------
+  // Public paths answer without a caller AND without a session lookup; only a
+  // gated route pays for token/session verification. In-process GraphQL/MCP
+  // calls run through this middleware too (the executor calls app.request()),
+  // so the passthrough headers decide the caller there exactly as a browser
+  // cookie does over HTTP.
+  app.use('*', async (c: Context<Env>, next: Next) => {
+    if (PUBLIC.some((re) => re.test(c.req.path))) return next()
+    const caller = await auth.resolveUser(c.req.raw)
+    if (!caller) return c.json({ error: 'unauthorized' }, 401)
+    c.set('caller', caller)
     await next()
   })
 
-  app.openapi(listNotes, (c) => {
-    const { tag, limit } = c.req.valid('query')
-    const all = [...notes.values()].filter((n) => !tag || n.tags.includes(tag))
-    return c.json(all.slice(0, limit), 200)
-  })
-  app.openapi(getNote, (c) => {
-    const { id } = c.req.valid('param')
-    const note = notes.get(id)
-    return note ? c.json(note, 200) : c.json({ error: 'not found' }, 404)
-  })
-  app.openapi(createNote, (c) => {
-    const body = c.req.valid('json')
-    const note = { id: `n${nextId++}`, ...body }
-    notes.set(note.id, note)
-    return c.json(note, 201)
-  })
-  app.openapi(deleteNote, (c) => {
-    const { id } = c.req.valid('param')
-    if (!notes.delete(id)) return c.json({ error: 'not found' }, 404)
-    return c.body(null, 204)
-  })
-  app.openapi(stats, (c) => {
-    const byTag: Record<string, number> = {}
-    for (const n of notes.values()) for (const t of n.tags) byTag[t] = (byTag[t] ?? 0) + 1
-    return c.json({ total: notes.size, by_tag: byTag }, 200)
-  })
-  app.openapi(categories, (c) => c.json(categoryTree, 200))
+  registerRoutes(app, store)
 
-  // The zValidator style — no createRoute, no registry: the wrapper exposes
-  // the schema for bridge introspection (a plain zValidator's schema is
-  // closure-private and cannot be derived).
-  app.get(
-    '/search',
-    bridgeValidator(
-      'query',
-      z.object({
-        q: z.string().min(1).describe('Search text.'),
-        limit: z.coerce.number().int().min(1).max(50).default(5).describe('Max hits.'),
-      }),
-      { tags: ['notes'], summary: 'Search notes by title.', responseSchema: z.array(Note) },
-    ),
-    (c) => {
-      const { q, limit } = c.req.valid('query')
-      const needle = q.toLowerCase()
-      const hits = [...notes.values()]
-        .filter((n) => n.title.toLowerCase().includes(needle))
-        .slice(0, limit)
-      return c.json(hits, 200)
+  // ---- REST docs: OpenAPI 3.1 document + Swagger UI ------------------------
+  // The document is derived from the SAME createRoute() definitions the bridge
+  // reads — one source, two views (Swagger for humans, GraphQL for agents).
+  // `/docs` is public so the tour starts before login; the try-it-out calls
+  // still answer 401 until a session cookie or Bearer is present.
+  app.doc31('/openapi.json', {
+    openapi: '3.1.0',
+    info: {
+      title: 'notes-api',
+      version: '0.1.0',
+      description: 'Demo REST surface — the same routes the GraphQL/MCP bridge derives from.',
     },
-  )
+    tags: [{ name: 'notes' }, { name: 'analytics' }, { name: 'catalog:tree' }],
+  })
+  app.get('/docs', swaggerUI({ url: '/openapi.json' }))
 
+  // ---- bridge: GraphQL + MCP over the same routes --------------------------
   const bridge = new HonoGqlMcp(app, {
     name: 'notes-api',
     allowMutation: true,
+    passthroughHeaders: ['authorization', 'cookie'],
     instructions:
       'Notes service exposed as GraphQL (reads and writes). Domains: notes, analytics, catalog. ' +
       'Call get_schema once, then compose routes in a single graphql_query — a failing route nulls ' +
-      'only its own field. Writes go through graphql_mutation.',
+      'only its own field. Writes go through graphql_mutation. You only see notes you own.',
+    // With GitHub configured the MCP endpoint is OAuth-gated; without it the
+    // endpoint stays open so the demo runs from a blank .env.
+    ...(githubConfigured
+      ? {
+          auth: {
+            verifyToken: auth.verifyToken,
+            // Advertised in the 401 challenge so the client can discover the AS.
+            resourceMetadataUrl: `${BASE_URL}/.well-known/oauth-protected-resource/mcp`,
+            discovery: {
+              resourceServerUrl: MCP_RESOURCE,
+              resourceName: 'notes-api MCP',
+              authorizationServerMetadata: auth.asMetadata,
+            },
+          },
+        }
+      : {}),
   })
   bridge.mountTo(app, '/mcp')
   bridge.mountGraphQL(app) // POST /graphql + GraphiQL at /graphiql
 
-  // A second, gated deployment over the same app — one token, two checks:
-  // the shared-secret gate verifies the ENDPOINT, and the same Bearer reaches
-  // the routes through per-caller passthrough, where the app's middleware
-  // verifies the BUSINESS CALL.
-  const secure = new HonoGqlMcp(app, {
-    name: 'notes-api-secure',
-    allowMutation: true,
-    auth: { sharedSecret: TOKEN },
-  })
-  secure.mountTo(app, '/mcp-secure')
-
-  return { app, bridge, secure }
+  return { app, bridge, store, auth }
 }
 
 // ---- serve when run directly --------------------------------------------------
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
 if (isMain) {
-  const { app, bridge } = createApp()
-  const port = Number(process.env.PORT ?? 8100)
-  serve({ fetch: app.fetch, port }, (info) => {
+  if (secretIsDefault) {
+    console.warn('[config] BETTER_AUTH_SECRET is the dev default — set a random one before exposing this server.')
+  }
+  const { app, bridge, store } = await createApp()
+  const server = serve({ fetch: app.fetch, port: PORT }, (info) => {
     console.log(`notes-api demo`)
-    console.log(`  REST     http://localhost:${info.port}/notes  (authorization: Bearer ${TOKEN})`)
-    console.log(`  MCP      http://localhost:${info.port}/mcp`)
-    console.log(`  MCP+auth http://localhost:${info.port}/mcp-secure  (shared-secret gate, same Bearer)`)
+    console.log(`  REST     http://localhost:${info.port}/categories  (public)`)
+    console.log(`  Docs     http://localhost:${info.port}/docs        (Swagger UI)`)
+    console.log(`  Login    http://localhost:${info.port}/          (GitHub${githubConfigured ? '' : ' — not configured'})`)
+    console.log(`  GraphQL  http://localhost:${info.port}/graphiql`)
+    console.log(
+      `  MCP      http://localhost:${info.port}/mcp  ${githubConfigured ? '(OAuth 2.1 gated)' : '(open — no GitHub creds)'}`,
+    )
     console.log(`\nDerived GraphQL schema (${bridge.handler.domains.length} domains):\n`)
     console.log(bridge.handler.getSDL())
   })
+
+  // Close the HTTP server and the database before exit, so WAL is checkpointed
+  // and the sqlite file is left clean.
+  let shuttingDown = false
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) return
+    shuttingDown = true
+    console.log(`\n${signal} — shutting down`)
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+    store.close()
+    process.exit(0)
+  }
+  process.on('SIGINT', () => void shutdown('SIGINT'))
+  process.on('SIGTERM', () => void shutdown('SIGTERM'))
 }

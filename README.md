@@ -326,7 +326,7 @@ Two implementation notes (both regression-tested):
 
 ## Verified (PoC, 2026-10-10)
 
-`npm test` — 50 end-to-end checks, all passing (plain `node`, type-stripping mode):
+`npm test` — 54 end-to-end checks, all passing (plain `node`, type-stripping mode):
 
 - composition across 3 domains (nested tag included); field selection;
   partial failure (a 404 route nulls only itself, siblings survive)
@@ -355,6 +355,10 @@ Two implementation notes (both regression-tested):
 - `/graphql` face (POST with credentials, 405 usage, partial-failure 200) and
   GraphiQL; `maxResponseChars` truncation marker; `rateLimit` 429; `run()`
   standalone server on a real port
+- REST docs: `/openapi.json` (OpenAPI 3.1) carries every zod-openapi route,
+  with the recursive `Category` schema emitted as a `$ref` (not inlined); the
+  Swagger UI at `/docs` is mounted and wired to it; both public while business
+  routes stay gated
 - auth: the gate's 401 `WWW-Authenticate` challenge (no/bad/null token);
   sharedSecret full MCP round trip; gate-vs-route independence (gate token ≠
   route token → `HTTP_401` field errors); `requiredScopes` 403 with scope
@@ -363,6 +367,10 @@ Two implementation notes (both regression-tested):
   design, normal paths untouched); config errors (verifier sources are
   mutually exclusive); and the `instanceof Response` realm regression
   (`run()` + gate in one process)
+- the example end to end: a real better-auth JWT passes the gate AND the
+  routes (one token, two checks, `WWW-Authenticate` carries `resource_metadata`);
+  per-user isolation (another user's note is absent from the list and a direct
+  fetch is 404)
 - OTel: the four-layer waterfall (HTTP → tools/call → graphql.execute →
   route span, one traceId) with a real in-memory exporter + AsyncHooks
   context manager; envelope traceparent joining the CALLER's trace;
@@ -375,7 +383,8 @@ Two implementation notes (both regression-tested):
   tools/call with and without credentials, `/graphql` + `/graphiql`
 
 Stack: hono 4.13 · @hono/zod-openapi 1.6 (Zod v4 only) · graphql-js 17 ·
-@modelcontextprotocol/server 2.3 · Node ≥ 22 (graphql-js 17's floor).
+@modelcontextprotocol/server 2.3 · better-auth 1.7 (OAuth 2.1 AS + JWT) ·
+better-sqlite3 (persistence) · Node ≥ 22 (graphql-js 17's floor).
 
 ## Not in the PoC (the Python original has them)
 
@@ -383,19 +392,74 @@ Stack: hono 4.13 · @hono/zod-openapi 1.6 (Zod v4 only) · graphql-js 17 ·
   verified in isolation during research; not covered by this test suite
 - benchmark comparison against fastmcp-TS `fromOpenAPI` / ClawQL (the Python
   repo's comparison/ methodology ports directly)
-- ready-made IdP adapters (Python fastmcp ships GitHub/Google/Auth0/Keycloak
-  providers; the TS SDK is Resource-Server-side only — bring your own IdP
-  and wire it through `verifyToken`/`verifier`)
+- ready-made IdP adapters inside the library (Python fastmcp ships
+  GitHub/Google/Auth0/Keycloak providers; the TS SDK is Resource-Server-side
+  only, so the library takes an AS metadata object + `verifyToken`). The
+  **example** wires a real IdP — `better-auth` supplies GitHub login and the
+  OAuth 2.1 Authorization Server; see *The example app* under Dev.
 
 ## Dev
 
 ```bash
 npm install
-npm test          # 50 e2e checks (plain node — type stripping, no bundler)
-npm run example   # notes demo on :8100 — REST + /mcp + /mcp-secure (gated) + /graphql + /graphiql
+npm test          # 54 e2e checks (plain node — type stripping, no bundler)
+npm run example   # notes demo on :8020 — REST + Swagger + GitHub login + OAuth-gated /mcp + GraphiQL
 HONO_GQL_MCP_OTEL=1 npm run example   # + route spans under graphql.execute
 npm run typecheck
 ```
+
+`npm test` runs against a throwaway database (`test/.tmp/e2e.sqlite`, set by
+`test/e2e.env` and deleted at the start of each run), so it never touches the
+demo's `example/data.sqlite` and counts are exact on every run. To point the
+example at another file, set `SQLITE_PATH`.
+
+### The example app
+
+`example/` is a notes service a browser user and an agent both reach. It shows
+the two integrations the library leaves to the host:
+
+| Surface | Auth | How |
+| --- | --- | --- |
+| REST docs (`/docs`, `/openapi.json`) | none (public) | Swagger UI over the OpenAPI 3.1 document `app.doc31()` derives from the same `createRoute()` definitions the bridge reads |
+| REST / GraphQL (browser, GraphiQL) | GitHub login | `better-auth` session cookie; `resolveUser` reads it |
+| MCP (`/mcp`) | OAuth 2.1 | `better-auth` `mcp()` plugin is the Authorization Server; the bridge's `verifyToken` checks its JWTs |
+| Route calls (inside GraphQL/MCP) | the caller's own header | `passthroughHeaders: ['authorization', 'cookie']` |
+
+One source, many views: the same `createRoute()` / `bridgeValidator()` route
+definitions feed the REST handlers, the Swagger document, and the derived
+GraphQL schema — nothing is declared twice. A recursive `z.lazy` schema must
+carry a `.meta({ id })` so the OpenAPI build emits a `$ref` instead of
+inlining forever (without it `getOpenAPIDocument()` overflows the stack —
+`/categories` is the worked example).
+
+`better-auth` supplies browser login (GitHub social) **and** the OAuth 2.1
+Authorization Server (`/api/auth/oauth2/authorize|token|register`, RFC 8414 +
+9728 discovery, PKCE, JWT via JWKS) from one handler. The bridge stays
+Resource-Server-side: it is handed the AS metadata (`asMetadata`) and a
+`verifyToken` (JWKS signature + issuer + audience), nothing more.
+
+Setup:
+
+1. GitHub → Developer settings → OAuth Apps → New. Homepage
+   `http://localhost:8020`; **Authorization callback URL**
+   `http://localhost:8020/api/auth/callback/github`.
+2. `cp example/.env.example example/.env`, fill `GITHUB_CLIENT_ID` /
+   `GITHUB_CLIENT_SECRET`, set `BETTER_AUTH_SECRET` (`openssl rand -hex 32`).
+3. `npm run example`. With creds empty the app still runs: REST/GraphQL stay
+   open and `/mcp` is ungated.
+
+Notes are **per-user**: a note carries an owner, and someone else's note is a
+404 — it does not exist for you. Persistence is a single SQLite file
+(`example/data.sqlite`, gitignored): better-auth's tables (users, sessions,
+JWKS, OAuth clients/tokens) and the demo's `notes` share it, so notes AND the
+MCP login survive restarts. Delete the file for a factory reset.
+
+An agent connects with the standard MCP OAuth flow — `POST /mcp` answers 401
+with `WWW-Authenticate: Bearer resource_metadata=...`, the client discovers
+`/.well-known/oauth-protected-resource/mcp` → `/.well-known/oauth-authorization-server`,
+registers (DCR or a Client ID Metadata Document), runs the browser login +
+consent, and sends the resulting JWT as its Bearer. One token, two checks: the
+same JWT passes the gate and reaches the routes.
 
 The runner is plain `node` (Node ≥ 22.18 strips types natively), not tsx —
 a bundler-style resolver loads two `@opentelemetry/api` instances from its
