@@ -101,27 +101,30 @@ test('domainsFor: tags win, multi-tag multi-path, path fallback, general fallbac
 
 test('mapper: z.enum → GraphQLEnumType on both sides, wire values preserved', () => {
   const mapper = new ZodGraphqlMapper()
-  const out = mapper.outputType(z.enum(['fast', 'slow']), 'Speed')
+  const Speed = z.enum(['fast', 'slow'])
+  const out = mapper.outputType(Speed, 'Speed')
   assert.ok(out instanceof GraphQLNonNull)
   const enumType = out.ofType
   assert.ok(enumType instanceof GraphQLEnumType)
   assert.equal(printType(enumType), 'enum Speed {\n  fast\n  slow\n}')
 
-  const arg = mapper.inputArg(z.enum(['fast', 'slow']).optional(), 'Speed')
-  // The input side maps the SAME schema again (input/output caches are
-  // separate), so the enum's name collides with the output 'Speed' and gets
-  // the reuse suffix — current behavior, documented here on purpose.
-  assert.equal(String(arg.type), 'Speed_2')
+  // A GraphQLEnumType serves both directions — ONE instance per schema
+  // (instance-keyed, like every mapper cache; share the z.enum to share the
+  // type), so the SDL carries no Speed/Speed_2 duplicate.
+  const arg = mapper.inputArg(Speed.optional(), 'Speed')
+  assert.equal(arg.type, enumType)
 })
 
 test('mapper: enum member names must be legal GraphQL identifiers, else JSON', () => {
   const mapper = new ZodGraphqlMapper()
-  const out = mapper.outputType(z.enum(['has space']), 'Bad')
+  const Bad = z.enum(['has space'])
+  const out = mapper.outputType(Bad, 'Bad')
   assert.equal(String(out), 'JSON!')
-  assert.ok(
-    mapper.degradations.some(([where, reason]) => where === 'Bad' && reason.includes('non-identifier')),
-    JSON.stringify(mapper.degradations),
-  )
+  // Both directions map the same schema — the degradation is recorded once.
+  mapper.inputArg(Bad, 'Bad')
+  const records = mapper.degradations.filter(([where]) => where === 'Bad')
+  assert.equal(records.length, 1, JSON.stringify(mapper.degradations))
+  assert.ok(records[0][1].includes('non-identifier'))
 })
 
 test('mapper: reused type names get a suffix and a degradation record', () => {

@@ -147,6 +147,12 @@ export class ZodGraphqlMapper {
   /** Object/enum/list types per schema instance, shared between input and output sides? No — separate. */
   private outCache = new Map<ZodType, GraphQLOutputType>()
   private inCache = new Map<ZodType, GraphQLInputType>()
+  /**
+   * …except enums: a GraphQLEnumType serves both directions unchanged, so
+   * ONE instance per schema is shared — otherwise the same z.enum would
+   * print twice (Speed + Speed_2 via the name-reuse suffix).
+   */
+  private enumCache = new Map<ZodType, GraphQLEnumType | GraphQLScalarType>()
   private names = new Set<string>(['Query', 'Mutation', 'JSON', 'Date', 'String', 'Int', 'Float', 'Boolean', 'ID'])
   /** Degradation audit: `[where, reason]` tuples, surfaced as startup notices and readiness().degradedFields. */
   readonly degradations: Array<[string, string]> = []
@@ -298,21 +304,26 @@ export class ZodGraphqlMapper {
   // ---- shared ------------------------------------------------------------
 
   private buildEnum(schema: ZodType, hint: string): GraphQLEnumType | GraphQLScalarType {
+    const cached = this.enumCache.get(schema)
+    if (cached) return cached
     const def = defOf(schema)
     const entries = def.entries as Record<string, string | number>
     // Same rule as the Python bridge: member names must be legal GraphQL
     // identifiers, else the whole enum degrades to JSON.
     if (!Object.keys(entries).every((k) => LEGAL_GRAPHQL_NAME.test(k))) {
       this.degradations.push([hint, 'enum with non-identifier member names → JSON'])
+      this.enumCache.set(schema, GraphQLJSON)
       return GraphQLJSON
     }
-    return new GraphQLEnumType({
+    const type = new GraphQLEnumType({
       name: this.uniqueName(pascal(hint)),
       description: schema.description,
       values: Object.fromEntries(
         Object.entries(entries).map(([name, value]) => [name, { value }]),
       ),
     })
+    this.enumCache.set(schema, type)
+    return type
   }
 
   private uniqueName(preferred: string): string {

@@ -188,16 +188,18 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
 
     // Uniform tool registration: every tool runs inside a `tools/call <name>`
     // span, parented to the CALLER's trace when the envelope carried one
-    // (2026-07-28 _meta traceparent). The SDK calls no-input tools as
-    // handler(ctx) and input tools as handler(args, ctx) — normalize first.
+    // (2026-07-28 _meta traceparent). The SDK's callback contract is static —
+    // an inputSchema-bearing tool is called handler(args, ctx), a no-input
+    // tool handler(ctx) — so it is decided by the config's shape here, never
+    // by sniffing the ctx object (an SDK upgrade could change ctx internals).
     // `any` here keeps the call-site callbacks' destructuring typed.
     const register = (name: string, config: unknown, cb: (args: any, ctx: any) => unknown): void => {
+      const hasInput = (config as { inputSchema?: unknown }).inputSchema !== undefined
       server.registerTool(
         name,
         config as never,
         ((a: unknown, b: unknown) => {
-          const [args, ctx] =
-            b === undefined && (a as { mcpReq?: unknown })?.mcpReq !== undefined ? [undefined, a] : [a, b]
+          const [args, ctx] = hasInput ? [a, b] : [undefined, a]
           return withToolSpan(name, (ctx as { mcpReq?: { envelope?: EnvelopeTrace } })?.mcpReq?.envelope, async () =>
             (await (cb as (args: unknown, ctx: unknown) => unknown)(args, ctx)) as never,
           )

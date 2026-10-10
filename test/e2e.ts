@@ -12,7 +12,7 @@ import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/cli
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
 import type { Hono } from 'hono'
 import { createApp } from '../example/app.ts'
-import { bridgeValidator, DuplicateFieldError, HonoGqlMcp, RouterGraphQLHandler } from '../src/index.ts'
+import { bridgeValidator, DuplicateFieldError, HonoGqlMcp, HonoGqlMcpConfigError, RouterGraphQLHandler } from '../src/index.ts'
 import { runAll, test } from './runner.ts'
 
 const AUTH = { authorization: 'Bearer demo-secret' }
@@ -70,7 +70,12 @@ test('recursion: z.lazy category tree serves true depth', async () => {
 })
 
 test('Boolean success: 204-style delete bridges as true', async () => {
-  const result = await gql(`mutation { notes { delete_note(id: "n3") } }`)
+  // Fresh app: this test deletes a note, and the shared fixture stays
+  // read-only so e2e order never matters.
+  const fresh = createApp()
+  const result = await fresh.bridge.handler.execute(`mutation { notes { delete_note(id: "n3") } }`, undefined, {
+    headers: AUTH,
+  })
   assert.equal(d(result).notes.delete_note, true)
 })
 
@@ -165,7 +170,8 @@ test('MCP: per-caller credentials reach the routes end-to-end', async () => {
 })
 
 test('MCP: graphql_mutation writes, then the write is visible', async () => {
-  const { client, transport } = await mcpClient(AUTH)
+  const fresh = createApp() // fresh store: this test writes
+  const { client, transport } = await mcpClient(AUTH, fresh.app)
   const created = JSON.parse(
     await callToolText(client, 'graphql_mutation', {
       query: `mutation { notes { create_note(body: { title: "from MCP", tags: ["mcp"] }) { id title } } }`,
@@ -323,7 +329,8 @@ test('hardening: max_depth rejects runaway nesting before anything executes', as
 })
 
 test('hardening: document cache caches the front half — execution stays live', async () => {
-  const h = new RouterGraphQLHandler(app, { allowMutation: true })
+  const fresh = createApp() // fresh store: this test writes
+  const h = new RouterGraphQLHandler(fresh.app, { allowMutation: true })
   const q = `{ notes { list_notes { id title } } }`
   const before = await h.execute(q, undefined, { headers: AUTH })
   await h.execute(
@@ -1070,6 +1077,172 @@ test('zValidator style: form target and wildcard paths are skipped; filters appl
   assert.ok(filtered.getSDL().includes('get_kept'), 'tag filter matches validator routes')
   const excluded = new RouterGraphQLHandler(app3, { exclude: ['/kept'] })
   assert.ok(!excluded.getSDL().includes('get_kept'), 'path filter drops validator routes')
+})
+
+// -- remaining review coverage: shapes, faces, and mounting ------------------------
+
+test('sub-app mounting: app.route() routes derive and execute (registry path merge)', async () => {
+  const sub = new OpenAPIHono()
+  sub.openapi(
+    {
+      method: 'get',
+      path: '/items',
+      tags: ['shop'],
+      operationId: 'list_items',
+      responses: { 200: okResponse(z.object({ v: z.string() })) },
+    } as Parameters<typeof createRoute>[0],
+    (c) => c.json({ v: 'sub' }, 200),
+  )
+  const app = new OpenAPIHono()
+  app.route('/api', sub)
+  const h = new RouterGraphQLHandler(app)
+  assert.ok(h.getSDL().includes('list_items'), 'sub-app route derived from the merged registry path')
+  const result = await h.execute(`{ shop { list_items { v } } }`)
+  assert.equal(d(result).shop.list_items.v, 'sub')
+})
+
+test('skips: multipart/form-data body routes are skipped as non-JSON', () => {
+  const app = new OpenAPIHono()
+  app.openapi(
+    {
+      method: 'post',
+      path: '/upload',
+      tags: ['misc'],
+      operationId: 'upload',
+      request: { body: { content: { 'multipart/form-data': { schema: z.object({}) } } } },
+      responses: { 200: okResponse(z.object({ ok: z.boolean() })) },
+    } as Parameters<typeof createRoute>[0],
+    (c) => c.json({ ok: true }, 200),
+  )
+  const h = new RouterGraphQLHandler(app, { allowMutation: true })
+  assert.ok(
+    h.skips.some((s) => s.path === '/upload' && s.reason.includes('non-JSON request body')),
+    JSON.stringify(h.skips),
+  )
+})
+
+test('Boolean success: an explicit z.void() response bridges as true', async () => {
+  const app = new OpenAPIHono()
+  // A read route too — a Query type with zero fields is not a valid schema.
+  app.openapi(
+    {
+      method: 'get',
+      path: '/status',
+      tags: ['misc'],
+      operationId: 'status',
+      responses: { 200: okResponse(z.object({ ok: z.boolean() })) },
+    } as Parameters<typeof createRoute>[0],
+    (c) => c.json({ ok: true }, 200),
+  )
+  app.openapi(
+    createRoute({
+      method: 'post',
+      path: '/nothing',
+      tags: ['misc'],
+      operationId: 'do_nothing',
+      request: {
+        body: { content: { 'application/json': { schema: z.object({ force: z.boolean().default(false) }) } } },
+      },
+      responses: { 200: { description: 'ok', content: { 'application/json': { schema: z.void() } } } },
+    }),
+    (c) => c.json(null, 200),
+  )
+  const h = new RouterGraphQLHandler(app, { allowMutation: true })
+  const result = await h.execute(`mutation { misc { do_nothing(body: {}) } }`)
+  assert.equal(d(result).misc.do_nothing, true)
+})
+
+test('raw JSON bucket: a non-JSON 2xx body comes back as raw text', async () => {
+  const app = new OpenAPIHono()
+  app.get(
+    '/rawtext',
+    bridgeValidator('query', z.object({}), { tags: ['raw'] }), // no responseSchema → JSON bucket
+    (c) => c.text('plain-body', 200),
+  )
+  const h = new RouterGraphQLHandler(app)
+  const result = await h.execute(`{ raw { get_rawtext } }`)
+  assert.equal(d(result).raw.get_rawtext, 'plain-body')
+})
+
+test('fragments execute against the derived schema', async () => {
+  const result = await gql(`query {
+    notes { list_notes { ...NoteBits } }
+  }
+  fragment NoteBits on Note { title }`)
+  assert.ok(d(result).notes.list_notes[0].title)
+})
+
+test('graphql face: 400 for non-JSON body and missing query; operationName selects the operation', async () => {
+  const fresh = createApp()
+
+  const notJson = await fresh.app.request('/graphql', {
+    method: 'POST',
+    headers: { 'content-type': 'text/plain' },
+    body: 'not-json',
+  })
+  assert.equal(notJson.status, 400)
+  assert.ok(JSON.stringify(await notJson.json()).includes('must be JSON'))
+
+  const noQuery = await fresh.app.request('/graphql', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({}),
+  })
+  assert.equal(noQuery.status, 400)
+  assert.ok(JSON.stringify(await noQuery.json()).includes("'query'"))
+
+  const multi = await fresh.app.request('/graphql', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer demo-secret' },
+    body: JSON.stringify({
+      query: 'query A { notes { list_notes { title } } } query B { analytics { stats { total } } }',
+      operationName: 'B',
+    }),
+  })
+  assert.equal(multi.status, 200)
+  const body = (await multi.json()) as { data: Record<string, unknown> }
+  assert.ok(body.data.analytics, 'operationName B ran')
+  assert.equal(body.data.notes, undefined, 'operation A did not run')
+})
+
+test('progressive: get_query_schema on a mutation-only domain answers DOMAIN_NOT_FOUND', async () => {
+  const app = new OpenAPIHono()
+  app.openapi(
+    createRoute({
+      method: 'post',
+      path: '/flush',
+      tags: ['writes'],
+      operationId: 'flush',
+      request: {
+        body: { content: { 'application/json': { schema: z.object({ force: z.boolean().default(false) }) } } },
+      },
+      responses: { 200: { description: 'ok', content: { 'application/json': { schema: z.boolean() } } } },
+    }),
+    (c) => c.json(true, 200),
+  )
+  const b = new HonoGqlMcp(app, { name: 'mut-only', allowMutation: true, mode: 'progressive' })
+  b.mountTo(app, '/mcp')
+  const { client, transport } = await mcpClient({}, app)
+
+  const queries = envelope(await callToolText(client, 'list_queries', { domain: 'writes' }))
+  assert.equal(queries.success, true)
+  assert.deepEqual(queries.data.queries, [])
+
+  const frag = envelope(await callToolText(client, 'get_query_schema', { domain: 'writes' }))
+  assert.equal(frag.success, false)
+  assert.equal(frag.error_type, 'DOMAIN_NOT_FOUND')
+  assert.ok(frag.error.includes('no GraphQL operations'), frag.error)
+
+  await client.close()
+  await transport.close()
+})
+
+test('config: progressiveThreshold / maxResponseChars / rateLimit validated at the facade too', () => {
+  const app = createApp().app
+  assert.throws(() => new HonoGqlMcp(app, { progressiveThreshold: 0 }), HonoGqlMcpConfigError)
+  assert.throws(() => new HonoGqlMcp(app, { progressiveThreshold: 2.5 }), HonoGqlMcpConfigError)
+  assert.throws(() => new HonoGqlMcp(app, { maxResponseChars: 0 }), HonoGqlMcpConfigError)
+  assert.throws(() => new HonoGqlMcp(app, { rateLimit: { maxPerSecond: 0 } }), HonoGqlMcpConfigError)
 })
 
 // -- runner ----------------------------------------------------------------------
