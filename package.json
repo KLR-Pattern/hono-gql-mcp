@@ -1,0 +1,32 @@
+{
+  "name": "hono-gql-mcp",
+  "version": "0.1.0",
+  "description": "The agent access layer for Hono — derive a GraphQL schema from your zod-openapi routes, expose MCP with a constant 2-tool set",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "example": "tsx example/app.ts",
+    "test": "tsx test/e2e.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@asteasolutions/zod-to-openapi": "^9.1.0",
+    "@hono/zod-openapi": "^1.6.3",
+    "@modelcontextprotocol/client": "^2.3.1",
+    "@modelcontextprotocol/hono": "^2.0.2",
+    "@modelcontextprotocol/server": "^2.3.1",
+    "graphql": "^17.0.2",
+    "hono": "^4.13.13",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@hono/node-server": "^1",
+    "@types/node": "^22",
+    "tsx": "^4",
+    "typescript": "^5"
+  }
+}
