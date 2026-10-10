@@ -1,0 +1,19 @@
+name: ci
+
+# Everything that is not a release. Releases run the same test job through
+# publish.yml, so a green pull request and a green release mean the same thing.
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+# A new push to the same branch or PR supersedes the in-flight run — no reason
+# to finish testing a commit that is already obsolete.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml

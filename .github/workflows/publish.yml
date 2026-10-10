@@ -9,37 +9,10 @@ on:
     tags: ['v*']
 
 jobs:
+  # The same job the PR gate runs (ci.yml), so a green pull request and a green
+  # release mean the same thing. Nothing is published unless it passes.
   verify:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      # Node 24 is the Active LTS line, and it ships npm 11.x — above the
-      # 11.5.0 floor OIDC trusted publishing needs. Node 22 would ship npm 10.x
-      # and require an extra `npm install -g npm@latest` step.
-      # `.nvmrc` is the single source of truth for the version; keep it in sync.
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: .nvmrc
-          cache: npm
-
-      # `npm ci` fails if package-lock.json and package.json disagree, which is
-      # exactly the check we want before anything is published.
-      - run: npm ci
-
-      - run: npm run typecheck
-
-      # GITHUB_CLIENT_ID/SECRET are the knobs the example uses to decide
-      # whether to wire GitHub login and gate /mcp. One auth test asserts the
-      # gate challenge, so it needs them set to non-empty values. They are
-      # placeholders: the suite never calls GitHub (tokens are minted locally
-      # through better-auth's signJWT, never through the OAuth exchange), so no
-      # network access or real credentials are involved.
-      - name: Test
-        run: npm test
-        env:
-          GITHUB_CLIENT_ID: ci-placeholder-id
-          GITHUB_CLIENT_SECRET: ci-placeholder-secret
+    uses: ./.github/workflows/test.yml
 
   publish:
     needs: verify

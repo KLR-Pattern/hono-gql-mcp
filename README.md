@@ -377,6 +377,25 @@ Two details worth knowing before changing build config:
 - The build uses `tsc` only. There is no bundler, so nothing in the emit
   depends on how the package is consumed.
 
+### CI
+
+Three workflow files, and the split is deliberate:
+
+| File | Trigger | Does |
+| --- | --- | --- |
+| `test.yml` | `workflow_call` only | `npm ci` → typecheck → 61 checks → build |
+| `ci.yml` | PR and push to `master` | calls `test.yml` |
+| `publish.yml` | `v*` tag | calls `test.yml`, then publishes |
+
+`test.yml` holds the steps **once**. Both gates call it instead of repeating
+them, so a check added to one cannot go missing from the other — the failure
+mode that split definitions produce is green pull requests followed by a failed
+release. The build step runs there too, not just at tag time: `tsconfig.build.json`
+is separate from the typecheck config, so the emit can break on its own.
+
+`ci.yml` cancels superseded runs on the same branch, since finishing a test for
+an already-replaced commit wastes runner time and delays the current one.
+
 ### Releasing
 
 Push a tag that matches `package.json`'s version:
@@ -386,8 +405,15 @@ npm version patch        # or minor / major — writes package.json + the tag
 git push --follow-tags
 ```
 
-`.github/workflows/publish.yml` then typechecks, runs the 61 checks, rebuilds,
-verifies the tag equals the version, and publishes with `--provenance`.
+`publish.yml` then runs the same `test.yml` job, verifies the tag equals the
+version, and publishes with `--provenance`.
+
+One ordering rule is easy to trip over: **the workflow file must already be on
+the default branch before you push the tag.** Adding `.github/workflows/publish.yml`
+and pushing the tag in the same push runs nothing and reports nothing — GitHub
+evaluates the tag event against the default branch, where the workflow does not
+exist yet. Push the workflow first, then tag. Re-pushing an existing tag
+(`git push origin --delete v0.1.1 && git push origin v0.1.1`) is the repair.
 
 Authentication is **OIDC trusted publishing** — no `NPM_TOKEN` secret exists in
 the repository. Trusted publishers are configured on the *package's* settings
