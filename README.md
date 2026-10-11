@@ -97,6 +97,22 @@ same way; the field name derives as `<method>_<path>`. zod-openapi routes
 (registered via `app.openapi`) never duplicate — their handlers carry no
 attachment.
 
+Migrating an existing codebase is import-line-only and mechanically safe —
+`@hono/zod-validator` exports exactly `zValidator` and `Hook`, and this
+package re-exports both:
+
+```bash
+grep -rl '@hono/zod-validator' src | xargs sed -i 's|@hono/zod-validator|hono-gql-mcp|'
+```
+
+Or change nothing at all: a bundler alias redirects the original specifier,
+so existing sources stay untouched.
+
+```ts
+// vite.config.ts (esbuild/webpack/tsup have the same knob)
+resolve: { alias: { '@hono/zod-validator': 'hono-gql-mcp' } }
+```
+
 ### The Zod mapper
 
 Mapping rules:
