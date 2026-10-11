@@ -101,6 +101,17 @@ Mapping rules:
 - `z.array` query args travel as **repeated keys** (`?tags=a&tags=b`), which is
   what Hono's query parser collects back into an array. `URLSearchParams.set()`
   would send `?tags=a,b` and the route's own `z.array()` check would answer 400
+- argument names must be legal GraphQL identifiers; a wire name like a
+  hyphenated path param (`{order-id}`) is sanitized for the schema (`order_id`)
+  and translated back at execution — the route stays callable. Two params
+  sanitizing onto the same name skip the route with a reason
+- object schemas whose KEYS are not legal identifiers (e.g.
+  `{'content-type': …}`) degrade to the JSON scalar — the field name cannot be
+  represented and input values cannot be translated back before the route's
+  own validation
+- `z.date()` maps to a custom `Date` scalar (ISO on the wire). As a QUERY arg
+  the value arrives as a string — declare the route with `z.coerce.date()`
+  (plain `z.date()` rejects strings, same as it does over raw HTTP)
 
 ## Capability buckets
 
@@ -497,6 +508,7 @@ npm test          # 18 unit + 75 e2e checks (plain node — type stripping, no b
 npm run test:cov  # the same under c8 — 98% line / 87% branch over src/
 npm run example   # notes demo on :8020 — REST + Swagger + GitHub login + OAuth-gated /mcp + GraphiQL
 npm run example:oauth   # notes_oauth demo (examples/notes_oauth), same :8020
+npm run smoke:sink     # kitchen-sink battery: every derived field executed, REST/GraphQL parity
 HONO_GQL_MCP_OTEL=1 npm run example   # + route spans under graphql.execute
 npm run typecheck # noEmit — the repo runs from source
 npm run build     # emit dist/ for publishing

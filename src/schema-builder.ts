@@ -258,33 +258,49 @@ export function buildSchema(routes: RouteInfo[], executor: RouteExecutor, opts: 
     }
 
     // ---- args: params (required) + query (optional/default) + one body ----
+    // Arg names must be legal GraphQL identifiers; wire names like a
+    // hyphenated path param (`{order-id}`) are SANITIZED for the schema and
+    // translated back at execution (plan.argNames) — the route stays
+    // callable, unlike a crash on assertName.
     const args: Leaf['args'] = {}
+    const argNames: Record<string, string> = {} // graphqlName → wireName
+    let argCollision: string | null = null
+    const addArg = (wireKey: string, type: unknown, extra: { description?: string; defaultValue?: unknown } = {}) => {
+      const gqlName = LEGAL_GRAPHQL_NAME.test(wireKey) ? wireKey : wireKey.replace(/\W/g, '_') || '_'
+      if (gqlName !== wireKey) argNames[gqlName] = wireKey
+      if (Object.hasOwn(args, gqlName)) {
+        argCollision = `argument name collision after sanitizing: '${wireKey}' → '${gqlName}' is already an argument`
+        return
+      }
+      args[gqlName] = { type, ...extra }
+    }
     for (const key of paramsKeys) {
       const sub = paramsShape[key]
       // Path params always render into the URL — force required.
       const mapped = mapper.inputType(sub as never, `${hint}${pascal(key)}`)
       const unwrapped = mapped instanceof GraphQLNonNull ? mapped.ofType : mapped
-      args[key] = {
-        type: new GraphQLNonNull(unwrapped as GraphQLNullableInputType),
+      addArg(key, new GraphQLNonNull(unwrapped as GraphQLNullableInputType), {
         description: (sub as { description?: string }).description,
-      }
+      })
     }
     for (const key of queryKeys) {
       const sub = queryShape[key]
       const arg = mapper.inputArg(sub as never, `${hint}${pascal(key)}`)
-      args[key] = {
-        type: arg.type,
+      addArg(key, arg.type, {
         ...(arg.hasDefault ? { defaultValue: arg.defaultValue } : {}),
         description: (sub as { description?: string }).description,
-      }
+      })
     }
     if (bodySchema) {
       const arg = mapper.inputArg(bodySchema as never, hint)
-      args['body'] = {
-        type: arg.type,
+      addArg('body', arg.type, {
         ...(arg.hasDefault ? { defaultValue: arg.defaultValue } : {}),
         description: 'The request body.',
-      }
+      })
+    }
+    if (argCollision) {
+      skip(argCollision)
+      continue
     }
 
     leaves[kind].push({
@@ -294,7 +310,7 @@ export function buildSchema(routes: RouteInfo[], executor: RouteExecutor, opts: 
       args,
       description: route.summary ?? route.description,
       ...(route.deprecated ? { deprecationReason: 'Deprecated upstream route.' } : {}),
-      plan: { route, method, booleanSuccess },
+      plan: { route, method, booleanSuccess, ...(Object.keys(argNames).length ? { argNames } : {}) },
     })
   }
 

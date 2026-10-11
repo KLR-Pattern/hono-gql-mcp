@@ -28,6 +28,12 @@ export interface CallPlan {
   method: string
   /** True for void/no-content routes: the field is a Boolean success marker. */
   booleanSuccess: boolean
+  /**
+   * graphqlName → wireName for arguments whose wire name is not a legal
+   * GraphQL identifier (e.g. a hyphenated path param `{order-id}`): the
+   * schema exposes the sanitized name, execution translates back.
+   */
+  argNames?: Record<string, string>
 }
 
 export type IncomingHeaders = Headers | Record<string, string> | undefined
@@ -129,6 +135,15 @@ export class RouteExecutor {
 
   async call(plan: CallPlan, args: Record<string, unknown>, incoming: IncomingHeaders): Promise<unknown> {
     const { route, method, booleanSuccess } = plan
+    // Sanitized GraphQL arg names → the route's wire names.
+    if (plan.argNames) {
+      for (const [gqlName, wireName] of Object.entries(plan.argNames)) {
+        if (gqlName in args) {
+          args[wireName] = args[gqlName]
+          delete args[gqlName]
+        }
+      }
+    }
     // '/users/{id}' → '/users/<urlencoded id>' — Starlette-style convertor-free
     const path = route.path.replace(/\{([^}]+)\}/g, (_, key: string) => {
       const v = args[key]

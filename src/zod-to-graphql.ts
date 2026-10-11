@@ -210,6 +210,13 @@ export class ZodGraphqlMapper {
 
   private buildObjectOutput(schema: ZodType, hint: string): GraphQLObjectType {
     const def = defOf(schema)
+    // Wire keys that are not legal GraphQL identifiers would crash assertName
+    // at construction — degrade the whole object to the JSON scalar instead
+    // (still callable, no per-field selection), the same bucket as unions.
+    if (!Object.keys(def.shape as object).every((k) => LEGAL_GRAPHQL_NAME.test(k))) {
+      this.degradations.push([hint, 'object field names not legal GraphQL identifiers → JSON'])
+      return GraphQLJSON as never
+    }
     const meta = globalRegistry.get(schema) as { title?: string; description?: string } | undefined
     const name = this.uniqueName(meta?.title ?? pascal(hint))
     // Fields are a thunk: recursion through z.lazy resolves against the cache
@@ -289,6 +296,13 @@ export class ZodGraphqlMapper {
 
   private buildObjectInput(schema: ZodType, hint: string): GraphQLInputObjectType {
     const def = defOf(schema)
+    // Same guard as the output side: an illegal key cannot become a GraphQL
+    // field, and input values cannot be translated back before the route's
+    // own validation — degrade to JSON.
+    if (!Object.keys(def.shape as object).every((k) => LEGAL_GRAPHQL_NAME.test(k))) {
+      this.degradations.push([hint, 'object field names not legal GraphQL identifiers → JSON (argument)'])
+      return GraphQLJSON as never
+    }
     const meta = globalRegistry.get(schema) as { title?: string; description?: string } | undefined
     const name = this.uniqueName((meta?.title ?? pascal(hint)) + 'Input')
     return new GraphQLInputObjectType({

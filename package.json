@@ -30,7 +30,9 @@
     "test": "node test/unit.ts && node --env-file-if-exists=example/.env --env-file=test/e2e.env test/e2e.ts",
     "test:cov": "c8 --include 'src/**' --reporter=text node test/unit.ts && c8 --include 'src/**' --no-clean --reporter=text --reporter=html node --env-file-if-exists=example/.env --env-file=test/e2e.env test/e2e.ts",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "example:sink": "node examples/kitchen-sink/app.ts",
+    "smoke:sink": "node examples/kitchen-sink/smoke.ts"
   },
   "engines": {
     "node": ">=22.18"

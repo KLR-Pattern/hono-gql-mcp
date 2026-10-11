@@ -250,5 +250,62 @@ test('skips: a required header/cookie parameter skips the route; optional stays 
   assert.ok(sdl.includes('hdr_optional:'), 'optional-header route stays callable')
 })
 
+// -- arg-name sanitization + illegal object keys (kitchen-sink findings) ---------
+
+test('args: a hyphenated wire param becomes a legal GraphQL arg, translated back at execution', async () => {
+  const app = new OpenAPIHono()
+  app.openapi(
+    createRoute({
+      method: 'get',
+      path: '/orders/{order-id}',
+      tags: ['t'],
+      operationId: 'hyphen',
+      request: { params: z.object({ 'order-id': z.string() }) },
+      responses: { 200: okResponse(z.object({ id: z.string() })) },
+    }),
+    (c) => c.json({ id: c.req.valid('param')['order-id'] }, 200),
+  )
+  const h = new RouterGraphQLHandler(app)
+  assert.ok(h.getSDL().includes('hyphen(order_id:'), 'sanitized arg name in SDL')
+  const result = await h.execute(`{ t { hyphen(order_id: "o1") { id } } }`)
+  assert.equal((result.data as any).t.hyphen.id, 'o1', 'wire name restored for the route')
+})
+
+test('args: sanitizing two params onto one name skips the route with a reason', () => {
+  const app = new OpenAPIHono()
+  app.openapi(
+    {
+      method: 'get',
+      path: '/x/{a-b}',
+      tags: ['t'],
+      operationId: 'collide',
+      request: {
+        params: z.object({ 'a-b': z.string() }),
+        query: z.object({ a_b: z.string().optional() }),
+      },
+      responses: { 200: okResponse(z.object({ v: z.string() })) },
+    } as Parameters<typeof createRoute>[0],
+    (c) => c.json({ v: 'x' }, 200),
+  )
+  const h = new RouterGraphQLHandler(app)
+  assert.ok(
+    h.skips.some((s) => s.reason.includes("collision after sanitizing: 'a_b'")),
+    JSON.stringify(h.skips),
+  )
+  assert.ok(!h.getSDL().includes('collide'))
+})
+
+test('mapper: object keys that are not legal GraphQL identifiers degrade to JSON', () => {
+  const mapper = new ZodGraphqlMapper()
+  const out = mapper.outputType(z.object({ 'content-type': z.string() }), 'Hdr')
+  assert.equal(String(out), 'JSON!')
+  assert.ok(
+    mapper.degradations.some(([where, why]) => where === 'Hdr' && why.includes('not legal GraphQL identifiers')),
+    JSON.stringify(mapper.degradations),
+  )
+  const arg = mapper.inputArg(z.object({ 'x-y': z.string() }), 'In')
+  assert.equal(String(arg.type), 'JSON!') // non-optional → NonNull(JSON)
+})
+
 // -- runner ------------------------------------------------------------------------
 await runAll('unit')
