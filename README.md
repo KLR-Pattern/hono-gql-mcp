@@ -6,7 +6,7 @@ route. The GraphQL layer and MCP server are derived from your existing
 `@hono/zod-openapi` app: zero decorators, zero schema changes.
 
 > **Status:** published as [`hono-gql-mcp`](https://www.npmjs.com/package/hono-gql-mcp)
-> `0.1.1`. Still a PoC — see [Package status](#package-status) for what the
+> `0.2.0`. Still a PoC — see [Package status](#package-status) for what the
 > build does and does not cover yet.
 
 ```ts
