@@ -5,15 +5,10 @@
 [![Node](https://img.shields.io/node/v/hono-gql-mcp)](https://www.npmjs.com/package/hono-gql-mcp)
 [![License: MIT](https://img.shields.io/npm/l/hono-gql-mcp)](LICENSE)
 
-Exposing a REST API to agents one tool per route has a cost that grows with
-the API: every call ships N tool schemas, the tool list drifts from the
-OpenAPI document, and a multi-step task costs N round trips.
-
-**hono-gql-mcp is the agent access layer for Hono** — a GraphQL layer and an
-MCP server derived from your existing `@hono/zod-openapi` app, zero
-decorators and zero schema changes. Agents get ONE `graphql_query` tool:
-composition in a single call, per-caller credentials on every route, and a
-tool count that stays constant as the API grows.
+Derive a GraphQL schema and an MCP server from an existing `@hono/zod-openapi`
+app — no decorators, no schema changes. Agents call one `graphql_query` tool
+instead of one tool per route, so the tool list stays small and a caller can
+combine several routes in a single request.
 
 > **Status:** early but tested — unit + e2e suites run on every push (CI
 > badge), provenance-signed publishes. History: [CHANGELOG](CHANGELOG.md);
@@ -43,7 +38,7 @@ mcp.mountTo(app, '/mcp')      // MCP at /mcp, auth rides the caller's headers
 mcp.mountGraphQL(app)         // optional: POST /graphql + GraphiQL
 ```
 
-### Connect an agent
+### Connect an MCP client
 
 ```bash
 claude mcp add --transport http my-api http://localhost:8020/mcp
@@ -159,8 +154,8 @@ Mapping rules:
 
 ## Capability buckets
 
-**The promise:** if a route works over HTTP, it stays
-callable here. Every route lands in one of four buckets, classified at scan
+If a route works over HTTP, it stays callable here.
+Every route lands in one of four buckets, classified at scan
 time (thunks are forced at construction — the audit and any
 DuplicateFieldError are startup facts, not first-query surprises):
 
@@ -605,9 +600,9 @@ the two integrations the library leaves to the host:
 | MCP (`/mcp`) | OAuth 2.1 | `better-auth` `mcp()` plugin is the Authorization Server; the bridge's `verifyToken` checks its JWTs |
 | Route calls (inside GraphQL/MCP) | the caller's own header | `passthroughHeaders: ['authorization', 'cookie']` |
 
-One source, many views: the same `createRoute()` / `zValidator()` route
-definitions feed the REST handlers, the Swagger document, and the derived
-GraphQL schema — nothing is declared twice. A recursive `z.lazy` schema must
+The same `createRoute()` / `zValidator()` definitions feed the REST
+handlers, the Swagger document, and the derived GraphQL schema — nothing is
+declared twice. A recursive `z.lazy` schema must
 carry a `.meta({ id })` so the OpenAPI build emits a `$ref` instead of
 inlining forever (without it `getOpenAPIDocument()` overflows the stack —
 `/categories` is the worked example).
