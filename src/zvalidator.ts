@@ -23,8 +23,7 @@
  *
  * The 3rd argument is discriminated by shape: a FUNCTION is the original
  * zValidator hook (validation behavior unchanged); a plain OBJECT is bridge
- * metadata. `bridgeValidator` (the original wrapper's name) remains as a
- * deprecated alias.
+ * metadata.
  */
 import { zValidator as zodValidator, type Hook } from '@hono/zod-validator'
 import type { Env, Input, MiddlewareHandler, TypedResponse, ValidationTargets } from 'hono'
@@ -133,29 +132,6 @@ export function zValidator(target: any, schema: any, hookOrMeta?: any, metaArg?:
   return Object.assign(mw, {
     [VALIDATOR_SCHEMA]: { target, schema: schema as ZodType, options } satisfies ValidatorAttachment,
   })
-}
-
-/**
- * @deprecated Import { zValidator } from 'hono-gql-mcp' instead — the shadow
- * export keeps every existing call site unchanged, including the name.
- * (Own generic signature: T must stay the caller's concrete schema so
- * `c.req.valid()` typing flows, not the broad ZodType.)
- */
-export function bridgeValidator<
-  T extends ZodSchema,
-  Target extends keyof ValidationTargets,
-  E extends Env,
-  P extends string,
-  In = zInput<T>,
-  Out = zOutput<T>,
-  I extends Input = DefaultInput<Target, In, Out>,
-  V extends I = I,
->(
-  target: Target,
-  schema: T,
-  options: BridgeValidatorOptions = {},
-): MiddlewareHandler<E, P, V, ZodValidatorFailureResponse<T>> {
-  return zValidator(target, schema, options) as never
 }
 
 // Re-export hono's hook type under the name callers of the ORIGINAL package

@@ -1,6 +1,6 @@
 /**
  * The notes service — REST routes in the zod-openapi style plus one
- * bridgeValidator route. The bridge derives the GraphQL schema and the MCP
+ * zValidator shadow route. The bridge derives the GraphQL schema and the MCP
  * tools from exactly these definitions.
  *
  * Every note route reads the caller off the context (`c.get('caller')`, set by

@@ -187,7 +187,7 @@ export class RouterGraphQLHandler {
 
   constructor(app: OpenAPIHono<any>, opts: HandlerOptions = {}) {
     // Two introspection sources: the zod-openapi registry, and Hono's own
-    // route table for bridgeValidator middleware (same filters on both).
+    // route table for zValidator middleware (the shadow export) (same filters on both).
     this.routes = [...scanRoutes(app.openAPIRegistry, opts), ...scanValidatorRoutes(app, opts)]
     const hardening = resolveHardening(opts)
     const executor = new RouteExecutor(app as never, opts.passthroughHeaders ?? ['authorization'], {

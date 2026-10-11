@@ -21,7 +21,7 @@ for (const suffix of ['', '-wal', '-shm']) rmSync(`${DB_PATH}${suffix}`, { force
 
 const { createApp } = await import('../example/app.ts')
 import { parse, validate } from 'graphql'
-import { bridgeValidator, documentDepth, HonoGqlMcp, LruCache, RouterGraphQLHandler, zValidator } from '../src/index.ts'
+import { documentDepth, HonoGqlMcp, LruCache, RouterGraphQLHandler, zValidator } from '../src/index.ts'
 
 const tests: Array<[name: string, fn: () => void | Promise<void>]> = []
 const test = (name: string, fn: () => void | Promise<void>) => tests.push([name, fn])
@@ -1445,10 +1445,10 @@ test('otel: route.timeout and route.queue surface as events on graphql.execute',
 // sqlite file is left clean for the next `npm test`.
 process.on('exit', () => store.close())
 
-// -- bridgeValidator: the zValidator-style route source -----------------------------
+// -- zValidator shadow routes (the second introspection source) ---------------------
 
 test('zValidator style: derived into the schema, typed args, callable, side by side with zod-openapi', async () => {
-  // createApp carries one bridgeValidator route (/notes/search) next to its
+  // createApp carries one shadow zValidator route (/notes/search) next to its
   // zod-openapi routes — no DuplicateFieldError proves the two sources merge.
   const sdl = handler.getSDL()
   assert.ok(sdl.includes('get_search'), 'derived field present')
@@ -1467,7 +1467,7 @@ test('zValidator style: no responseSchema → raw-JSON bucket with a notice, not
   })
   app2.get(
     '/ping',
-    bridgeValidator('query', z.object({ name: z.string() }), { tags: ['misc'], summary: 'Ping.' }),
+    zValidator('query', z.object({ name: z.string() }), { tags: ['misc'], summary: 'Ping.' }),
     (c) => c.json({ pong: c.req.valid('query').name }),
   )
   const h = new RouterGraphQLHandler(app2, { allowMutation: false })
@@ -1485,11 +1485,11 @@ test('zValidator style: no responseSchema → raw-JSON bucket with a notice, not
 
 test('zValidator style: form target and wildcard paths are skipped; filters apply', () => {
   const app3 = new OpenAPIHono()
-  app3.post('/upload', bridgeValidator('form', z.object({})), (c) => c.text('ok'))
-  app3.get('/wild/*', bridgeValidator('query', z.object({})), (c) => c.text('ok'))
+  app3.post('/upload', zValidator('form', z.object({})), (c) => c.text('ok'))
+  app3.get('/wild/*', zValidator('query', z.object({})), (c) => c.text('ok'))
   app3.get(
     '/kept',
-    bridgeValidator('query', z.object({}), { tags: ['keep'] }),
+    zValidator('query', z.object({}), { tags: ['keep'] }),
     (c) => c.text('ok'),
   )
   const h = new RouterGraphQLHandler(app3)
@@ -1604,7 +1604,7 @@ test('raw JSON bucket: a non-JSON 2xx body comes back as raw text', async () => 
   const app = new OpenAPIHono()
   app.get(
     '/rawtext',
-    bridgeValidator('query', z.object({}), { tags: ['raw'] }), // no responseSchema → JSON bucket
+    zValidator('query', z.object({}), { tags: ['raw'] }), // no responseSchema → JSON bucket
     (c) => c.text('plain-body', 200),
   )
   const h = new RouterGraphQLHandler(app)

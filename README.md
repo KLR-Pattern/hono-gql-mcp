@@ -95,8 +95,7 @@ bucket (callable, not field-selectable). Semantics vs zod-openapi routes:
 targets and wildcard paths are dropped; tags and path filters apply the
 same way; the field name derives as `<method>_<path>`. zod-openapi routes
 (registered via `app.openapi`) never duplicate — their handlers carry no
-attachment. `bridgeValidator` (the previous name for the wrapper) remains
-exported as a deprecated alias.
+attachment.
 
 ### The Zod mapper
 
@@ -551,7 +550,7 @@ the two integrations the library leaves to the host:
 | MCP (`/mcp`) | OAuth 2.1 | `better-auth` `mcp()` plugin is the Authorization Server; the bridge's `verifyToken` checks its JWTs |
 | Route calls (inside GraphQL/MCP) | the caller's own header | `passthroughHeaders: ['authorization', 'cookie']` |
 
-One source, many views: the same `createRoute()` / `bridgeValidator()` route
+One source, many views: the same `createRoute()` / `zValidator()` route
 definitions feed the REST handlers, the Swagger document, and the derived
 GraphQL schema — nothing is declared twice. A recursive `z.lazy` schema must
 carry a `.meta({ id })` so the OpenAPI build emits a `$ref` instead of

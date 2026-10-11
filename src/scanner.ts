@@ -65,7 +65,7 @@ export function jsonBodySchemaOf(route: RouteConfig): ZodType | undefined {
   return media && !('$ref' in media) ? (media.schema as ZodType | undefined) : undefined
 }
 
-// ---- second introspection source: bridgeValidator middleware ---------------------
+// ---- second introspection source: zValidator middleware (the shadow export) ---------------------
 
 /** Hono path → OpenAPI path: `:id` → `{id}`; `{...}` regex constraints keep their name. */
 function honoPathToOpenApi(path: string): string | null {
@@ -74,11 +74,11 @@ function honoPathToOpenApi(path: string): string | null {
 }
 
 /**
- * Scan Hono's own route table for bridgeValidator middleware and synthesize
+ * Scan Hono's own route table for zValidator middleware (the shadow export) and synthesize
  * zod-openapi-shaped RouteConfigs from the attached schemas. Hono registers
  * every handler of `app.get(path, mw, handler)` as its own route entry —
  * the validator middleware (carrying our Symbol) is one of them. Routes
- * without a bridgeValidator stay invisible, so zod-openapi routes (registered
+ * without the shadow stay invisible, so zod-openapi routes (registered
  * via app.openapi) never duplicate here.
  */
 export function scanValidatorRoutes(app: Hono<any, any, any>, filters: ScanFilters = {}): RouteInfo[] {
