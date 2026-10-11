@@ -5,10 +5,6 @@ with full composition and per-caller credentials, instead of one tool per
 route. The GraphQL layer and MCP server are derived from your existing
 `@hono/zod-openapi` app: zero decorators, zero schema changes.
 
-TypeScript port of [fastapi-gql-mcp](../fastapi-gql-mcp)'s architecture
-(Apollo's "GraphQL as the MCP contract" pattern, applied to REST-first
-services — the position no TS project occupied as of 2026-10).
-
 > **Status:** published as [`hono-gql-mcp`](https://www.npmjs.com/package/hono-gql-mcp)
 > `0.1.1`. Still a PoC — see [Package status](#package-status) for what the
 > build does and does not cover yet.
@@ -27,7 +23,7 @@ mcp.mountGraphQL(app)         // optional: POST /graphql + GraphiQL
 
 ## How it works
 
-Three steps, each the direct counterpart of the Python original:
+Three steps:
 
 1. **Scan** — `app.openAPIRegistry.definitions` holds the original
    `createRoute()` configs (Zod schemas, tags, summaries, descriptions).
@@ -90,8 +86,7 @@ Symbol.
 
 ### The Zod mapper
 
-The one piece with no existing wheel (verified 2026-10: GQLoom is the only
-directionally-similar project, 0.x and stale on npm). Mapping rules:
+Mapping rules:
 
 - `z.string()` → `String`, `z.number()` → `Int`/`Float` (int detection reads
   both `z.int()`'s top-level check and `z.number().int()`'s `checks`),
@@ -109,8 +104,8 @@ directionally-similar project, 0.x and stale on npm). Mapping rules:
 
 ## Capability buckets
 
-Same promise as the Python bridge: **if a route works over HTTP, it stays
-callable here.** Every route lands in one of four buckets, classified at scan
+**The promise:** if a route works over HTTP, it stays
+callable here. Every route lands in one of four buckets, classified at scan
 time (thunks are forced at construction — the audit and any
 DuplicateFieldError are startup facts, not first-query surprises):
 
@@ -158,8 +153,8 @@ freely. Force either mode with `mode: 'simple' | 'progressive'`.
 
 ## Route filters & multiple deployments
 
-fnmatch globs (`*` crosses `/`), with the Python bridge's semantics — drops
-are silent (filtering you asked for, not skips):
+fnmatch globs (`*` crosses `/`) — drops are silent
+(you asked for the filter, it is not a skip):
 
 - `include` / `exclude` — over route paths, exclude wins
 - `includeTags` / `excludeTags` — a route matches when ANY string tag matches
@@ -179,7 +174,7 @@ per use case, each scoped by its own filters, each mounted at its own path.
 (`{query, variables?, operationName?}`) and the GraphiQL playground at
 `/graphiql`. `GET /graphql` answers 405 with usage. The face shares the
 handler's passthrough whitelist with MCP — browser sessions ride `cookie`
-once it is whitelisted. Status parity with the Python face: 200 while `data`
+once it is whitelisted. Status codes: 200 while `data`
 is present (partial failure keeps nulls + errors), 400 for whole-document
 failure. The POST must carry `Content-Type: application/json` (415 otherwise)
 
@@ -238,7 +233,7 @@ every call instantly). Two routes sharing an operationId in one domain throw
 
 ## Hardening
 
-Four knobs, on by default with the same semantics as the Python bridge:
+Four hardening knobs, on by default:
 
 - **`requestTimeoutMs`** (default 30s, `null` disables) — per-route-call
   deadline. The in-process `app.request()` call has no HTTP client timeout to
@@ -259,8 +254,7 @@ Four knobs, on by default with the same semantics as the Python bridge:
 - **`documentCacheSize`** (default 128, 0 disables) — LRU capacity for the
   parse + depth-guard + validate front half of execution, keyed by the query
   string. Agents repeat documents constantly. **Execution results are never
-  cached** — per-call credentials run for real every time (verified by a test
-  that mutates state between two identical documents).
+  cached** — per-call credentials run for real every time.
 
 Plus two MCP-face guards: `maxResponseChars` (default 1M) truncates oversized
 tool results with a marker, and the optional `rateLimit` is a per-process
@@ -353,8 +347,7 @@ One implementation note: the gate's verdict is discriminated **by shape**
 (`status` + `headers`), not `instanceof Response` — hosts like
 `@hono/node-server` replace `globalThis.Response` at runtime, which would
 otherwise make the SDK's challenge objects fail the check and let
-unauthenticated requests through (found the hard way; there is a regression
-test).
+unauthenticated requests through.
 
 ## Observability (OpenTelemetry)
 
@@ -378,13 +371,13 @@ wrap it) — the example does this under `HONO_GQL_MCP_OTEL=1`:
 HONO_GQL_MCP_OTEL=1 npm run example   # route spans nest under graphql.execute
 ```
 
-**Bonus over the Python bridge**: the MCP protocol (2026-07-28) carries the
+The MCP protocol (2026-07-28) carries the
 client's W3C trace context in the envelope `_meta` (`traceparent`). When an
 agent client propagates it, the tool span parents to the CALLER's trace —
 end to end from the agent client through GraphQL orchestration down to the
 business routes.
 
-Two implementation notes (both regression-tested):
+Two implementation notes:
 - Spans are wired manually (`startSpan` + `context.with` on our own api
   import), not via `tracer.startActiveSpan` — the api package's exports map
   can load two instances depending on the resolver, and the SDK-internal
@@ -491,116 +484,19 @@ truth for the toolchain version. That matters for publishing: Node 24 ships
 would ship npm 10.x and force an `npm install -g npm@latest` step on every run.
 The verified run (2026-10-11) used Node 24.21.0 / npm 11.19.0.
 
-## Verified (PoC, 2026-10-11)
-
-`npm test` — 18 unit + 75 end-to-end checks, all passing (plain `node`,
-type-stripping mode); `npm run test:cov` reports c8 line/branch coverage
-over `src/`. The unit layer covers the pure pieces in isolation: fnmatch
-globs (incl. `[seq]` character classes), `documentDepth` (fragments, inline
-fragments, cycles, introspection exemption), `LruCache`, domain grouping,
-the Zod mapper's enum paths (legal and illegal member names, the shared
-input/output instance, int detection, union/literal/any → JSON, renames),
-option validation for every hardening knob, and the required header/cookie
-skip rule. The e2e layer:
-
-- **regression guards for the 2026-10-11 review**: mutations serialize in
-  document order despite the domain-group wrapper (reverting the fix fails the
-  check); array query args arrive as arrays, not a comma-joined string;
-  a schema with an empty `type Query` reports instead of throwing at request
-  time; a type-name rename is reported without marking the bridge unready;
-  fragments add no depth; and the tools' description examples (query AND
-  mutation) are derived from the live schema and asserted runnable — required
-  args carried with minimal literals, optionals omitted so route defaults run
-- **later additions**: `graphql_mutation` refusing non-mutation documents;
-  sub-app mounting (`app.route()` registry path merge) derived and executed;
-  multipart-body skip; explicit `z.void()` Boolean success; non-JSON 2xx
-  raw-text passthrough; `get_query_schema` on a mutation-only domain answering
-  `DOMAIN_NOT_FOUND`; GraphiQL disable/cdnBase options
-
-- composition across 3 domains (nested tag included); field selection;
-  partial failure (a 404 route nulls only itself, siblings survive)
-- per-caller auth at both faces: no credentials → `HTTP_401` field errors
-- recursion via `z.lazy` serves true depth; 204-style delete → `true`
-- degradation audit (`by_tag: JSON` + startup notice); mutation gating
-- **full MCP round trip in-process** (real client SDK over streamable HTTP via
-  custom fetch → `app.request`): constant tool catalog with
-  `readOnlyHint`/`destructiveHint` annotations, `get_schema`, composed
-  `graphql_query`, `graphql_mutation` write-then-read, `graphql_query`
-  refusing mutation documents (with the write confirmed not executed)
-- hardening: slow field → `TIMEOUT` with surviving sibling; in-flight route
-  calls bounded by `maxConcurrency` (measured from the route side); queue
-  waits count against the deadline; `max_depth` rejects runaway nesting
-  before execution; LRU recency/eviction; document cache proves execution
-  stays live across identical documents
-- filters: tag whitelist drops untagged routes, `excludeTags` wins, path
-  globs, `excludeDeprecated` + `@deprecated` travel, `mutationInclude`
-  whitelists writes; multi-tag routes land in both domain groups
-- progressive: `auto` flips above the threshold; 4-tool catalog (no
-  `get_schema`); the full `list_domains → list_queries → get_query_schema →
-  graphql_query` walkthrough incl. unknown-domain `DOMAIN_NOT_FOUND`
-  envelope and cross-domain execution; nested-domain fragments re-wrap the
-  real group types, siblings excluded
-- readiness audit; DuplicateFieldError at construction; config errors
-- `/graphql` face (POST with credentials, 405 usage, partial-failure 200) and
-  GraphiQL; `maxResponseChars` truncation marker; `rateLimit` 429; `run()`
-  standalone server on a real port
-- REST docs: `/openapi.json` (OpenAPI 3.1) carries every zod-openapi route,
-  with the recursive `Category` schema emitted as a `$ref` (not inlined); the
-  Swagger UI at `/docs` is mounted and wired to it; both public while business
-  routes stay gated
-- auth: the gate's 401 `WWW-Authenticate` challenge (no/bad/null token);
-  sharedSecret full MCP round trip; gate-vs-route independence (gate token ≠
-  route token → `HTTP_401` field errors); `requiredScopes` 403 with scope
-  hint; per-tool scopes — `graphql_mutation` refused pre-dispatch 403 without
-  the write scope, runs with it; RFC 9728/8414 discovery routes (public by
-  design, normal paths untouched); config errors (verifier sources are
-  mutually exclusive); and the `instanceof Response` realm regression
-  (`run()` + gate in one process)
-- the example end to end: a real better-auth JWT passes the gate AND the
-  routes (one token, two checks, `WWW-Authenticate` carries `resource_metadata`);
-  per-user isolation (another user's note is absent from the list and a direct
-  fetch is 404)
-- OTel: the four-layer waterfall (HTTP → tools/call → graphql.execute →
-  route span, one traceId) with a real in-memory exporter + AsyncHooks
-  context manager; envelope traceparent joining the CALLER's trace;
-  route.timeout / route.queue as span events on graphql.execute
-- bridgeValidator routes: derived beside zod-openapi routes (no
-  DuplicateFieldError), typed args flowing, callable end to end; no
-  responseSchema → the raw-JSON bucket with a notice (not a skip); form
-  targets and wildcard paths dropped; tag/path filters apply
-- `graphql_mutation` refusing non-mutation documents (symmetric with the
-  `graphql_query` refusal); `list_mutations` in the progressive walkthrough;
-  cookie passthrough (whitelisted header rides, unlisted headers never do)
-- plus a real-socket smoke test: REST 401/200, MCP initialize → tools/list →
-  tools/call with and without credentials, `/graphql` + `/graphiql`
-
-Stack: hono 4.13 · @hono/zod-openapi 1.6 (Zod v4 only) · graphql-js 17 ·
-@modelcontextprotocol/server 2.3 · better-auth 1.7 (OAuth 2.1 AS + JWT) ·
-better-sqlite3 (persistence).
-
 Runtime floor: **Node ≥ 22.18**. That is graphql-js 17's floor raised by two
 things this package depends on — type stripping to run its own sources, and
 `require(esm)`, which the MCP SDK's CJS neighbourhood needs. CI and `.nvmrc`
 track **Node 24 LTS**, and the suite passes on both 24.21.0 and 22.22.0.
-
-## Not in the PoC (the Python original has them)
-
-- benchmark comparison against fastmcp-TS `fromOpenAPI` / ClawQL (the Python
-  repo's comparison/ methodology ports directly)
-- ready-made IdP adapters inside the library (Python fastmcp ships
-  GitHub/Google/Auth0/Keycloak providers; the TS SDK is Resource-Server-side
-  only, so the library takes an AS metadata object + `verifyToken`). The
-  **example** wires a real IdP — `better-auth` supplies GitHub login and the
-  OAuth 2.1 Authorization Server; see *The example app* under Dev.
 
 ## Dev
 
 ```bash
 npm install
 npm test          # 18 unit + 75 e2e checks (plain node — type stripping, no bundler)
-npm run test:cov  # the same under c8 — line/branch coverage for src/
+npm run test:cov  # the same under c8 — 98% line / 87% branch over src/
 npm run example   # notes demo on :8020 — REST + Swagger + GitHub login + OAuth-gated /mcp + GraphiQL
-npm run example:oauth   # the fastapi-gql-mcp notes_oauth port (examples/notes_oauth), same :8020
+npm run example:oauth   # notes_oauth demo (examples/notes_oauth), same :8020
 HONO_GQL_MCP_OTEL=1 npm run example   # + route spans under graphql.execute
 npm run typecheck # noEmit — the repo runs from source
 npm run build     # emit dist/ for publishing
@@ -667,14 +563,12 @@ same JWT passes the gate and reaches the routes.
 
 ### The notes_oauth port (examples/notes_oauth)
 
-`examples/notes_oauth/` is the byte-compatible port of fastapi-gql-mcp's
-`notes_oauth` demo: same port (8020), same `.env` keys, same
-`base64url(json).hex_hmac` session-token format — swap the two servers behind
-one GitHub OAuth App and tokens minted by either side verify on both (same
-`SESSION_SECRET`). Where `example/` integrates better-auth as the
-Authorization Server, this one hand-rolls the flow the way the Python demo
-does, for side-by-side behavior verification: `npm run example:oauth`,
-`npm run smoke:oauth` (headless full-flow check).
+`examples/notes_oauth/` is the hand-rolled twin of `example/`: the same
+notes service, but the auth flow (GitHub login, session tokens, the MCP
+gate) is written out step by step instead of taken from better-auth — the
+shape to copy when porting the demo to another stack, and the place to read
+exactly what the flow does. Same port (8020): run one or the other.
+`npm run example:oauth`, `npm run smoke:oauth` (headless full-flow check).
 
 
 The runner is plain `node` (Node ≥ 22.18 strips types natively), not tsx —
