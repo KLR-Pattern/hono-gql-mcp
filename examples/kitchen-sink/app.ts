@@ -6,6 +6,8 @@
  * Each section names what it exercises. Run the smoke for the anomaly
  * battery: `npm run smoke:sink`.
  */
+import { serve } from '@hono/node-server'
+import { pathToFileURL } from 'node:url'
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
 import { bridgeValidator, HonoGqlMcp } from '../../src/index.ts'
 
@@ -372,4 +374,13 @@ export function createSinkApp() {
   bridge.mountTo(app, '/mcp')
   bridge.mountGraphQL(app)
   return { app, bridge }
+}
+
+// ---- serve when run directly (the demo target — no auth, port 8110) -----------
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
+if (isMain) {
+  const { app } = createSinkApp()
+  serve({ fetch: app.fetch, port: 8110 }, () => {
+    console.log('kitchen-sink demo — http://localhost:8110  (MCP at /mcp, GraphQL at /graphql)')
+  })
 }

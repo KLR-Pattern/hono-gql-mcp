@@ -1,13 +1,18 @@
 # hono-gql-mcp
 
+[![npm version](https://img.shields.io/npm/v/hono-gql-mcp)](https://www.npmjs.com/package/hono-gql-mcp)
+[![CI](https://github.com/KLR-Pattern/hono-gql-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/KLR-Pattern/hono-gql-mcp/actions/workflows/ci.yml)
+[![Node](https://img.shields.io/node/v/hono-gql-mcp)](https://www.npmjs.com/package/hono-gql-mcp)
+[![License: MIT](https://img.shields.io/npm/l/hono-gql-mcp)](LICENSE)
+
 The **agent access layer for Hono** — agents call one `graphql_query` tool
 with full composition and per-caller credentials, instead of one tool per
 route. The GraphQL layer and MCP server are derived from your existing
 `@hono/zod-openapi` app: zero decorators, zero schema changes.
 
-> **Status:** published as [`hono-gql-mcp`](https://www.npmjs.com/package/hono-gql-mcp)
-> `0.2.1`. Still a PoC — see [Package status](#package-status) for what the
-> build does and does not cover yet.
+> **Status:** `0.2.1` on npm — early but tested: 21 unit + 75 e2e checks,
+> CI on every push, provenance-signed publishes. See
+> [Package status](#package-status) for the build details.
 
 ```ts
 import { OpenAPIHono } from '@hono/zod-openapi'
