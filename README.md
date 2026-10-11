@@ -5,14 +5,31 @@
 [![Node](https://img.shields.io/node/v/hono-gql-mcp)](https://www.npmjs.com/package/hono-gql-mcp)
 [![License: MIT](https://img.shields.io/npm/l/hono-gql-mcp)](LICENSE)
 
-The **agent access layer for Hono** — agents call one `graphql_query` tool
-with full composition and per-caller credentials, instead of one tool per
-route. The GraphQL layer and MCP server are derived from your existing
-`@hono/zod-openapi` app: zero decorators, zero schema changes.
+Exposing a REST API to agents one tool per route has a cost that grows with
+the API: every call ships N tool schemas, the tool list drifts from the
+OpenAPI document, and a multi-step task costs N round trips.
 
-> **Status:** on npm — early but tested: 21 unit + 75 e2e checks, CI on
-> every push, provenance-signed publishes. See
-> [Package status](#package-status) for the build details.
+**hono-gql-mcp is the agent access layer for Hono** — a GraphQL layer and an
+MCP server derived from your existing `@hono/zod-openapi` app, zero
+decorators and zero schema changes. Agents get ONE `graphql_query` tool:
+composition in a single call, per-caller credentials on every route, and a
+tool count that stays constant as the API grows.
+
+> **Status:** early but tested — unit + e2e suites run on every push (CI
+> badge), provenance-signed publishes. History: [CHANGELOG](CHANGELOG.md);
+> build details: [Package status](#package-status).
+
+## Installation
+
+```bash
+npm install hono-gql-mcp
+npm install hono @hono/zod-openapi zod   # peers — usually already present
+```
+
+Requires **Node ≥ 22.18**. The bridge itself is runtime-agnostic (it only
+calls `app.request()`); `run()` additionally needs `@hono/node-server`.
+
+## Quick start
 
 ```ts
 import { OpenAPIHono } from '@hono/zod-openapi'
@@ -24,6 +41,18 @@ const app = new OpenAPIHono()
 const mcp = new HonoGqlMcp(app, { name: 'my-app' })
 mcp.mountTo(app, '/mcp')      // MCP at /mcp, auth rides the caller's headers
 mcp.mountGraphQL(app)         // optional: POST /graphql + GraphiQL
+```
+
+### Connect an agent
+
+```bash
+claude mcp add --transport http my-api http://localhost:8020/mcp
+```
+
+or any MCP client (streamable HTTP):
+
+```json
+{ "mcpServers": { "my-api": { "type": "http", "url": "http://localhost:8020/mcp" } } }
 ```
 
 ## How it works
@@ -43,20 +72,6 @@ Three steps:
    `app.request()` (the same `#dispatch` production `fetch` uses), so
    middleware, auth and validation behave exactly as over HTTP. Sibling
    fields resolve concurrently.
-
-### Mutation ordering
-
-Reads run concurrently. Writes run **serially, in document order** — one
-mutation per `execute()` call, so two in-flight documents never serialize
-against each other.
-
-This needs the explicit `SerialQueue` in `executor.ts` because the tag grouping
-hides the write fields from graphql-js's own serializer. The spec serializes
-*root* mutation fields, but a tagged write lands at
-`mutation { notes { create_note } }` — the root holds the single group field
-`notes`, and the writes beneath it are ordinary object fields, which graphql-js
-resolves concurrently. Resolvers reach the queue in document order, and a FIFO
-chain restores the guarantee. A failing write does not block its successors.
 
 ### zValidator routes: change the import, nothing else
 
@@ -119,7 +134,7 @@ Mapping rules:
 
 - `z.string()` → `String`, `z.number()` → `Int`/`Float` (int detection reads
   both `z.int()`'s top-level check and `z.number().int()`'s `checks`),
-  `z.boolean()` → `Boolean`, `z.date()` → custom `Date` scalar (ISO wire format)
+  `z.boolean()` → `Boolean`
 - `z.object` → `GraphQLObjectType` (output) / `GraphQLInputObjectType` (input)
 - `z.enum` → `GraphQLEnumType`; member names must be legal GraphQL identifiers
 - `z.array` → `List` with `NonNull` elements; `z.lazy` → recursion via the
@@ -216,7 +231,11 @@ per use case, each scoped by its own filters, each mounted at its own path.
 handler's passthrough whitelist with MCP — browser sessions ride `cookie`
 once it is whitelisted. Status codes: 200 while `data`
 is present (partial failure keeps nulls + errors), 400 for whole-document
-failure. The POST must carry `Content-Type: application/json` (415 otherwise)
+failure. The POST must carry `Content-Type: application/json` (415 otherwise
+— Hono's body parser accepts any content-type, and a `text/plain` HTML-form
+POST is a CORS "simple request" that skips preflight, so the check is what
+keeps a cross-site page from firing mutations with a whitelisted session
+cookie).
 
 The playground loads pinned GraphiQL/React modules from the esm.sh CDN. Two
 knobs for environments that cannot reach it: `graphiql: false` skips the
@@ -227,17 +246,13 @@ at a self-hosted esm.sh-compatible mirror:
 bridge.mountGraphQL(app, { graphiql: false })                    // no CDN dependency
 bridge.mountGraphQL(app, { cdnBase: 'https://cdn.internal' })    // self-hosted mirror
 ```
-— Hono's body parser accepts any content-type, and a `text/plain` HTML-form
-POST is a CORS "simple request" that skips preflight, so the check is what
-keeps a cross-site page from firing mutations with a whitelisted session
-cookie.
 
 ## Options
 
 ```ts
 new HonoGqlMcp(app, {
   name: 'my-app',
-  version: '0.1.0',
+  version: '1.0.0',
   allowMutation: false,               // write routes off by default
   passthroughHeaders: ['authorization'],  // caller → route header whitelist ([] disables)
   instructions: '…',                  // initialize handshake text; a useful default is derived
@@ -329,6 +344,20 @@ Only `skips` and `degradedFields` count toward `ready`, because only they cost
 you a capability. `renames` is a separate list: a type name that had to be
 disambiguated. Keeping the two apart is what makes the CI gate usable — a
 harmless name collision must not fail an audit you would then switch off.
+
+### Mutation ordering
+
+Reads run concurrently. Writes run **serially, in document order** — one
+mutation per `execute()` call, so two in-flight documents never serialize
+against each other.
+
+This needs the explicit `SerialQueue` in `executor.ts` because the tag grouping
+hides the write fields from graphql-js's own serializer. The spec serializes
+*root* mutation fields, but a tagged write lands at
+`mutation { notes { create_note } }` — the root holds the single group field
+`notes`, and the writes beneath it are ordinary object fields, which graphql-js
+resolves concurrently. Resolvers reach the queue in document order, and a FIFO
+chain restores the guarantee. A failing write does not block its successors.
 
 ## Authentication
 
@@ -448,7 +477,7 @@ Three workflow files, and the split is deliberate:
 
 | File | Trigger | Does |
 | --- | --- | --- |
-| `test.yml` | `workflow_call` only | `npm ci` → typecheck → 61 checks → build |
+| `test.yml` | `workflow_call` only | `npm ci` → typecheck → 97 checks (21 unit + 76 e2e) → build |
 | `ci.yml` | PR and push to `master` | calls `test.yml` |
 | `publish.yml` | `v*` tag | calls `test.yml`, then publishes |
 
@@ -533,7 +562,7 @@ track **Node 24 LTS**, and the suite passes on both 24.21.0 and 22.22.0.
 
 ```bash
 npm install
-npm test          # 18 unit + 75 e2e checks (plain node — type stripping, no bundler)
+npm test          # 21 unit + 76 e2e checks (plain node — type stripping, no bundler)
 npm run test:cov  # the same under c8 — 98% line / 87% branch over src/
 npm run example   # notes demo on :8020 — REST + Swagger + GitHub login + OAuth-gated /mcp + GraphiQL
 npm run example:oauth   # notes_oauth demo (examples/notes_oauth), same :8020
@@ -553,6 +582,16 @@ CI passes them as job-level env.
 `test/e2e.env` and deleted at the start of each run), so it never touches the
 demo's `example/data.sqlite` and counts are exact on every run. To point the
 example at another file, set `SQLITE_PATH`.
+
+The runner is plain `node` (Node ≥ 22.18 strips types natively), not tsx —
+a bundler-style resolver loads two `@opentelemetry/api` instances from its
+exports map and silently breaks span nesting (see the Observability notes).
+
+Note the two runtimes this repo has: `npm test` and `npm run example` execute
+the TypeScript **sources** directly (Node's type stripping — that is why the
+code avoids parameter properties), while consumers of the published package get
+the emitted `dist/`. `npm run typecheck` follows the sources; `npm run build`
+is the only thing that reads `tsconfig.build.json`.
 
 ### The example app
 
@@ -612,12 +651,3 @@ exactly what the flow does. Same port (8020): run one or the other.
 `npm run example:oauth`, `npm run smoke:oauth` (headless full-flow check).
 
 
-The runner is plain `node` (Node ≥ 22.18 strips types natively), not tsx —
-a bundler-style resolver loads two `@opentelemetry/api` instances from its
-exports map and silently breaks span nesting (see the Observability notes).
-
-Note the two runtimes this repo has: `npm test` and `npm run example` execute
-the TypeScript **sources** directly (Node's type stripping — that is why the
-code avoids parameter properties), while consumers of the published package get
-the emitted `dist/`. `npm run typecheck` follows the sources; `npm run build`
-is the only thing that reads `tsconfig.build.json`.
