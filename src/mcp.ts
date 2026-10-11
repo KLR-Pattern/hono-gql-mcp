@@ -1,14 +1,11 @@
 /**
- * MCP face — a constant tool set over the bridged schema.
+ * MCP face — orchestration and the HTTP mount.
  *
  * Simple mode: get_schema + graphql_query (+ graphql_mutation) — one-shot
- * discovery for small apps.
+ * discovery for small apps (mcp-tools.ts).
  * Progressive mode (mode='progressive', or mode='auto' above
- * progressiveThreshold routes): a 4-layer walkthrough of the tag tree —
- *   list_domains → list_queries(domain) → get_query_schema(domain) → graphql_query
- *   (+ list_mutations when writes are on; get_schema is NOT registered)
- * Discovery is scoped; execution is not — graphql_query always runs against
- * the full schema, so fields from different domains combine freely.
+ * progressiveThreshold routes): the 4-layer tag-tree walkthrough
+ * (mcp-progressive.ts).
  *
  * The SDK's per-request factory (`createMcpHandler`) hands us the original
  * HTTP request, so the caller's own credentials ride into every resolver —
@@ -26,12 +23,11 @@ import {
   type McpHttpHandler,
 } from '@modelcontextprotocol/server'
 import type { Hono } from 'hono'
-import { z } from 'zod'
-import { GraphQLError, GraphQLList, GraphQLNonNull, GraphQLObjectType, GraphQLSchema, parse, printSchema, validate, GraphQLBoolean, GraphQLEnumType, GraphQLFloat, GraphQLInt, GraphQLString, type GraphQLFieldConfig, type GraphQLObjectType as ObjType, type GraphQLType } from 'graphql'
 import type { RouterGraphQLHandler } from './handler.ts'
-import { groupTypeName } from './schema-builder.ts'
 import type { ResolvedAuth } from './auth.ts'
 import { withToolSpan, type EnvelopeTrace } from './otel.ts'
+import { registerExecutorTools, registerSchemaTool, sampleDocument, type ToolContext } from './mcp-tools.ts'
+import { registerProgressiveTools } from './mcp-progressive.ts'
 
 export type ToolMode = 'auto' | 'simple' | 'progressive'
 /** After mode resolution: which toolset is actually registered. */
@@ -52,194 +48,21 @@ export interface McpFaceOptions {
   toolScopes?: Record<string, string[]>
 }
 
-function operationTypeOf(query: string): 'query' | 'mutation' | 'subscription' | null {
-  const doc = parse(query)
-  for (const def of doc.definitions) {
-    if (def.kind === 'OperationDefinition') return def.operation
-  }
-  return null
-}
-
 const limitText = (text: string, max: number): string =>
   text.length > max
     ? `${text.slice(0, max)}\n…[truncated — tool result exceeded maxResponseChars (${text.length} > ${max})]`
     : text
 
-// ---- progressive disclosure ---------------------------------------------------
-
-const parseDomain = (domain: string): string[] =>
-  domain
-    .split(':')
-    .map((s) => s.trim())
-    .filter(Boolean)
-
-function fieldBrief(name: string, field: GraphQLFieldConfig<unknown, unknown>): Record<string, unknown> {
-  const args = Object.entries(field.args ?? {}).map(([argName, arg]) => ({
-    name: argName,
-    type: String(arg.type),
-    ...(arg.description ? { description: arg.description } : {}),
-  }))
-  return {
-    name,
-    type: String(field.type),
-    ...(field.description ? { description: field.description } : {}),
-    ...(field.deprecationReason ? { deprecated: true } : {}),
-    ...(args.length > 0 ? { args } : {}),
-  }
-}
-
-const unwrapType = (t: GraphQLType): GraphQLType => (t instanceof GraphQLNonNull ? t.ofType : t)
-
-/** The group object type sitting at `path` under a root operation type. */
-function walkGroup(root: ObjType | null | undefined, path: string[]): ObjType | null {
-  let current: GraphQLType | null | undefined = root ?? undefined
-  for (const seg of path) {
-    if (!(current instanceof GraphQLObjectType)) return null
-    const field = current.getFields()[seg]
-    if (!field) return null
-    current = unwrapType(field.type)
-  }
-  return current instanceof GraphQLObjectType ? current : null
-}
-
-/** Peel NonNull and List wrappers down to the named type. */
-const namedType = (t: GraphQLType): GraphQLType =>
-  t instanceof GraphQLNonNull || t instanceof GraphQLList ? namedType(t.ofType) : t
-
-/** A literal for an optional arg, so the sample needs no variables. */
-function literalFor(type: GraphQLType): string {
-  const bare = namedType(type)
-  if (bare instanceof GraphQLEnumType) return bare.getValues()[0]?.name ?? 'FIRST'
-  if (bare instanceof GraphQLObjectType) return '{}'
-  if (bare === GraphQLBoolean) return 'true'
-  if (bare === GraphQLInt || bare === GraphQLFloat) return '0'
-  return '""'
-}
-
-/** The shortest valid selection set for a type: first scalar, else recurse one level. */
-function selectFor(type: GraphQLType, depth: number, seen: Set<string>): string {
-  const bare = namedType(type)
-  if (!(bare instanceof GraphQLObjectType)) return ''
-  if (depth >= 2 || seen.has(bare.name)) return ' { __typename }'
-  const next = new Set(seen).add(bare.name)
-  for (const [name, field] of Object.entries(bare.getFields())) {
-    if (name.startsWith('__')) continue
-    const inner = selectFor(field.type, depth + 1, next)
-    return ` { ${name}${inner} }`
-  }
-  return ' { __typename }'
-}
-
-/**
- * A minimal valid document for the first root field, built FROM the schema.
- *
- * A hardcoded example goes stale the moment a route's operationId or response
- * schema changes, and an LLM reads this string and copies it. Derived from the
- * live schema instead, and validated before it is offered — a sample that fails
- * validation would be worse than no sample. Null when nothing can be built.
- */
-function sampleQuery(schema: GraphQLSchema): string | null {
-  const groups = schema.getQueryType()?.getFields()
-  if (!groups) return null
-  const first = Object.entries(groups)[0]
-  if (!first) return null
-  const [groupName, groupField] = first
-  const group = namedType(groupField.type)
-  if (!(group instanceof GraphQLObjectType)) return null
-
-  const leaf = Object.entries(group.getFields())[0]
-  if (!leaf) return null
-  const [leafName, leafField] = leaf
-  const args = Object.entries(leafField.args ?? {})
-    .filter(([, a]) => !(a.type instanceof GraphQLNonNull))
-    .map(([name, a]) => `${name}: ${literalFor(a.type)}`)
-    .join(', ')
-  const doc = `{ ${groupName} { ${leafName}${args ? `(${args})` : ''}${selectFor(leafField.type, 0, new Set())} } }`
-  try {
-    return validate(schema, parse(doc)).length === 0 ? doc : null
-  } catch {
-    return null
-  }
-}
-
-/**
- * SDL fragment for one domain subtree, addressed exactly as in queries.
- * Re-wraps the schema's real group object up the ancestor chain with
- * sibling-free wrappers that KEEP the real group names, so the fragment's
- * field addresses match the schema while printSchema auto-collects only the
- * reachable types. (Port of the Python bridge's _domain_sdl.)
- */
-function domainSdl(handler: RouterGraphQLHandler, path: string[]): string | null {
-  const { queries, mutations } = handler.registry.subtreeFields(path)
-  if (queries.length === 0 && mutations.length === 0) return null
-
-  const wrap = (root: ObjType | null | undefined, kind: 'query' | 'mutation'): ObjType | null => {
-    const group = walkGroup(root, path)
-    if (!group) return null
-    let current: ObjType = group
-    for (let depth = path.length - 1; depth >= 1; depth--) {
-      const ancestors = path.slice(0, depth)
-      const childSeg = path[depth]
-      current = new GraphQLObjectType({
-        name: groupTypeName(ancestors, kind),
-        fields: { [childSeg]: { type: new GraphQLNonNull(current) } },
-      })
-    }
-    return current
-  }
-
-  const subQueryObj = wrap(handler.schema.getQueryType(), 'query')
-  if (!subQueryObj) return null
-  const subQuery = new GraphQLObjectType({
-    name: 'Query',
-    fields: { [path[0]]: { type: new GraphQLNonNull(subQueryObj) } },
-  })
-  let subMutation: ObjType | undefined
-  if (mutations.length > 0 && handler.schema.getMutationType()) {
-    const m = wrap(handler.schema.getMutationType(), 'mutation')
-    if (m) {
-      subMutation = new GraphQLObjectType({
-        name: 'Mutation',
-        fields: { [path[0]]: { type: new GraphQLNonNull(m) } },
-      })
-    }
-  }
-  return printSchema(new GraphQLSchema({ query: subQuery, ...(subMutation ? { mutation: subMutation } : {}) }))
-}
-
-// ---- tool registration --------------------------------------------------------
-
-interface Envelope {
-  success: boolean
-  data?: unknown
-  hint?: string
-  error?: string
-  error_type?: string
-}
-
-const ok = (data: unknown, hint?: string): Envelope => ({ success: true, data, ...(hint ? { hint } : {}) })
-const err = (error: string, errorType: string, hint?: string): Envelope => ({
-  success: false,
-  error,
-  error_type: errorType,
-  ...(hint ? { hint } : {}),
-})
-
-const unknownDomain = (handler: RouterGraphQLHandler, domain: string): Envelope => {
-  const available = handler.registry
-    .summary()
-    .map((s) => s.path.join(':'))
-    .join(', ')
-  return err(`Unknown domain '${domain}'.`, 'DOMAIN_NOT_FOUND', `Available top-level domains: ${available}. Use list_domains to browse the full tree.`)
-}
-
 export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOptions): McpHttpHandler {
   // Handler-level state (the SDK factory below runs PER REQUEST — stateless
   // serving — so anything computed once must live outside it):
   // - sdlCache: each domain's SDL fragment, rebuilt on every get_query_schema otherwise
-  // - example: the sample document, derived from the live schema and validated once
+  // - example: the sample documents, derived from the live schema and validated once
   const sdlCache = new Map<string, string>()
-  const example = sampleQuery(handler.schema)
+  const example = {
+    query: sampleDocument(handler.schema, 'query'),
+    mutation: sampleDocument(handler.schema, 'mutation'),
+  }
   return createMcpHandler((ctx) => {
     // Per-request: the caller's headers, captured here and passed down as
     // the GraphQL context — resolvers forward them through the whitelist.
@@ -266,8 +89,7 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
         }) as never,
       )
     }
-    const cap = opts.maxResponseChars
-    const text = (payload: unknown) => limitText(JSON.stringify(payload, null, 2), cap)
+    const text = (payload: unknown) => limitText(JSON.stringify(payload, null, 2), opts.maxResponseChars)
 
     // Per-tool scope challenges: the SDK enforces them before dispatch (HTTP
     // 403 + WWW-Authenticate insufficient_scope), against the authInfo the
@@ -277,216 +99,18 @@ export function buildMcpHandler(handler: RouterGraphQLHandler, opts: McpFaceOpti
       return scopes && scopes.length > 0 ? { scopeChallenge: requireScopes(...(scopes as [string, ...string[]])) } : {}
     }
 
-    const runDocument = (query: string, variables: Record<string, unknown> | undefined) =>
-      handler.execute(query, variables, { headers: callerHeaders })
+    const toolCtx: ToolContext = { handler, register, text, scopeFor }
 
     if (opts.mode === 'simple') {
-      register(
-        'get_schema',
-        {
-          title: 'Get the GraphQL schema',
-          description:
-            'The full GraphQL SDL of this service. Routes are grouped into domains by tag. ' +
-            'Read this once, then compose any routes in a single graphql_query.',
-          annotations: { readOnlyHint: true },
-            ...scopeFor('get_schema'),
-        },
-        async () => ({ content: [{ type: 'text', text: text(handler.getSDL()) }] }),
-      )
+      registerSchemaTool(toolCtx)
     } else {
-      // Progressive disclosure (domain SDL fragments served from the
-      // handler-level sdlCache above).
-      const resolve = (domain: string): string[] | null => {
-        const path = parseDomain(domain)
-        return handler.registry.has(path) ? path : null
-      }
-
-      register(
-        'list_domains',
-        {
-          title: 'List domains',
-          description:
-            "List the API's domains (derived from route tags) with operation counts. Domains form a tree: " +
-            "tag 'billing:invoice' yields domain 'billing' with subdomain 'invoice'. Untagged routes group by " +
-            "their first path segment. Start here, then drill in with list_queries(domain).",
-          annotations: { readOnlyHint: true },
-            ...scopeFor('list_domains'),
-        },
-        async () => ({
-          content: [{ type: 'text', text: text(ok({ domains: handler.registry.summary() }, 'Call list_queries(domain) with one of these domain paths.')) }],
-        }),
-      )
-
-      register(
-        'list_queries',
-        {
-          title: "List a domain's Query operations",
-          description:
-            "List the read (Query) operations of one domain subtree — 'billing' includes its subdomains. " +
-            'Each entry carries name, type, description and arguments.',
-          inputSchema: z.object({
-            domain: z.string().describe("Domain path from list_domains, e.g. 'billing:invoice'."),
-          }),
-          annotations: { readOnlyHint: true },
-            ...scopeFor('list_queries'),
-        },
-        async ({ domain }) => {
-          const path = resolve(domain)
-          if (!path) return { content: [{ type: 'text', text: text(unknownDomain(handler, domain)) }] }
-          const { queries } = handler.registry.subtreeFields(path)
-          const fields = queries
-            .filter(([owner, name]) => handler.queryFields.has(`${owner.join(':')}|${name}`))
-            .sort(([a], [b]) => a.join(':').localeCompare(b.join(':')))
-            .map(([owner, name]) => fieldBrief(name, handler.queryFields.get(`${owner.join(':')}|${name}`)!))
-          return {
-            content: [
-              {
-                type: 'text',
-                text: text(
-                  ok(
-                    { domain, queries: fields },
-                    'Call get_query_schema(domain) for the full SDL fragment of these operations, then graphql_query to execute.',
-                  ),
-                ),
-              },
-            ],
-          }
-        },
-      )
-
-      if (opts.allowMutation) {
-        register(
-          'list_mutations',
-          {
-            title: "List a domain's Mutation operations",
-            description: "List the write (Mutation) operations of one domain subtree.",
-            inputSchema: z.object({
-              domain: z.string().describe("Domain path from list_domains, e.g. 'billing'."),
-            }),
-            annotations: { readOnlyHint: true },
-            ...scopeFor('list_mutations'),
-          },
-          async ({ domain }) => {
-            const path = resolve(domain)
-            if (!path) return { content: [{ type: 'text', text: text(unknownDomain(handler, domain)) }] }
-            const { mutations } = handler.registry.subtreeFields(path)
-            const fields = mutations
-              .filter(([owner, name]) => handler.mutationFields.has(`${owner.join(':')}|${name}`))
-              .sort(([a], [b]) => a.join(':').localeCompare(b.join(':')))
-              .map(([owner, name]) => fieldBrief(name, handler.mutationFields.get(`${owner.join(':')}|${name}`)!))
-            return { content: [{ type: 'text', text: text(ok({ domain, mutations: fields })) }] }
-          },
-        )
-      }
-
-      register(
-        'get_query_schema',
-        {
-          title: "Get a domain's SDL fragment",
-          description:
-            "The SDL fragment for one domain: its operations and every type they reach — nothing else. " +
-            'Execution is NOT restricted to the domain: graphql_query runs against the full schema, ' +
-            'so fields from different domains may be combined in one query.',
-          inputSchema: z.object({
-            domain: z.string().describe("Domain path from list_domains, e.g. 'billing:invoice'."),
-          }),
-          annotations: { readOnlyHint: true },
-            ...scopeFor('get_query_schema'),
-        },
-        async ({ domain }) => {
-          const path = resolve(domain)
-          if (!path) return { content: [{ type: 'text', text: text(unknownDomain(handler, domain)) }] }
-          const cacheKey = path.join(':')
-          let sdl = sdlCache.get(cacheKey)
-          if (sdl === undefined) {
-            const built = domainSdl(handler, path)
-            if (built === null) {
-              return {
-                content: [
-                  {
-                    type: 'text',
-                    text: text(
-                      err(
-                        `Domain '${domain}' has no GraphQL operations.`,
-                        'DOMAIN_NOT_FOUND',
-                        "Pick a domain from list_domains that carries operations.",
-                      ),
-                    ),
-                  },
-                ],
-              }
-            }
-            sdl = built
-            sdlCache.set(cacheKey, sdl)
-          }
-          return {
-            content: [
-              {
-                type: 'text',
-                text: text(
-                  ok(
-                    { sdl },
-                    'Write a GraphQL query against this fragment and run it with graphql_query (other domains may be combined too).',
-                  ),
-                ),
-              },
-            ],
-          }
-        },
-      )
+      registerProgressiveTools(toolCtx, { allowMutation: opts.allowMutation, sdlCache })
     }
-
-    // ---- executor tools (both modes) ---------------------------------------
-    const queryInput = z.object({
-      query: z
-        .string()
-        .describe(`A GraphQL query document${example ? `, e.g. ${example}` : ''}`),
-      variables: z.record(z.string(), z.unknown()).optional().describe('Query variables, if the document declares any'),
+    registerExecutorTools(toolCtx, {
+      example,
+      allowMutation: opts.allowMutation,
+      runDocument: (query, variables) => handler.execute(query, variables, { headers: callerHeaders }),
     })
-
-    register(
-      'graphql_query',
-      {
-        title: 'Run a GraphQL query',
-        description:
-          'Execute a GraphQL query. Compose several routes in one document — a failing route ' +
-          'nulls only its own field while siblings survive. Select only the fields you need.',
-        inputSchema: queryInput,
-        annotations: { readOnlyHint: true },
-            ...scopeFor('graphql_query'),
-      },
-      async ({ query, variables }) => {
-        if (operationTypeOf(query) !== 'query') {
-          throw new GraphQLError('graphql_query refuses mutation documents — use graphql_mutation for writes')
-        }
-        const result = await runDocument(query, variables)
-        return { content: [{ type: 'text', text: text(result) }] }
-      },
-    )
-
-    if (opts.allowMutation) {
-      register(
-        'graphql_mutation',
-        {
-          title: 'Run a GraphQL mutation',
-          description:
-            'Execute a GraphQL mutation (writes). Mutation fields at the root run serially, in document order.',
-          inputSchema: z.object({
-            query: z.string().describe('A GraphQL mutation document'),
-            variables: z.record(z.string(), z.unknown()).optional(),
-          }),
-          annotations: { destructiveHint: true },
-            ...scopeFor('graphql_mutation'),
-        },
-        async ({ query, variables }) => {
-          if (operationTypeOf(query) !== 'mutation') {
-            throw new GraphQLError('graphql_mutation only runs mutation documents')
-          }
-          const result = await runDocument(query, variables)
-          return { content: [{ type: 'text', text: text(result) }] }
-        },
-      )
-    }
 
     return server
   })
@@ -512,7 +136,7 @@ export interface RateLimitOptions {
 export interface HostValidationOptions {
   /** Allowed Host header hostnames, port-agnostic ('api.example.com'; IPv6 needs brackets: '[::1]'). */
   allowedHostnames?: string[]
-  /** Allowed Origin header hostnames. A missing Origin passes (non-browser clients). */
+  /** Allowed Origin header origins. A missing Origin passes (non-browser clients). */
   allowedOrigins?: string[]
 }
 

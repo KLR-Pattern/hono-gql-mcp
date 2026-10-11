@@ -88,6 +88,8 @@ if (isMain) {
   ─────────────────────────────────────────────────────
   GitHub OAuth configured:  ${oauthConfigured()}
   MCP endpoint:             ${oauthConfigured() ? 'gated (Bearer = POST /auth/token output)' : 'open (no GitHub creds)'}
+  (The better-auth example — a full OAuth 2.1 AS from one library — is the
+   main example/, npm run example. This one is the Python-parity port.)
   (Ctrl-C to stop)
 `)
   })

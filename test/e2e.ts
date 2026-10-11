@@ -1644,6 +1644,91 @@ test('progressive: get_query_schema on a mutation-only domain answers DOMAIN_NOT
   await transport.close()
 })
 
+test('MCP: the graphql_mutation example is a real, executable document', async () => {
+  // The example app has mutations whose first field carries a REQUIRED body
+  // arg — the sample must include it with a minimal valid literal (empty
+  // title passes the route's z.string()), never index keys like `0:`.
+  const fresh = await createApp()
+  const b = new HonoGqlMcp(fresh.app, { name: 'mutation-example-check', allowMutation: true })
+  b.mountTo(fresh.app, '/mcp-mut-example')
+  const { client, transport } = await mcpClient(AUTH, fresh.app, '/mcp-mut-example')
+  const { tools } = await client.listTools()
+  const described = tools.find((t) => t.name === 'graphql_mutation')?.inputSchema as
+    | { properties?: { query?: { description?: string } } }
+    | undefined
+  const example = described?.properties?.query?.description?.match(/e\.g\. (.+)$/)?.[1]
+  assert.ok(example, `no example in the description: ${described?.properties?.query?.description}`)
+  assert.ok(!example.includes('0:'), `arg names must not be array indices: ${example}`)
+  assert.ok(example.startsWith('mutation {'), example)
+  assert.deepEqual(validate(b.handler.schema, parse(example)), [])
+  // Runnable against this very app — and cleaned up right after.
+  const result = JSON.parse(await callToolText(client, 'graphql_mutation', { query: example }))
+  assert.equal(result.errors, undefined, JSON.stringify(result.errors))
+  const created = result.data.notes.create_note
+  const deleted = JSON.parse(
+    await callToolText(client, 'graphql_mutation', {
+      query: `mutation { notes { delete_note(id: "${created.id}") } }`,
+    }),
+  )
+  assert.equal(deleted.errors, undefined)
+  await client.close()
+  await transport.close()
+})
+
+test('MCP: samples include REQUIRED arg literals (params), omit optionals (route defaults)', async () => {
+  // list_notes' optional tag/limit must stay OUT (limit: 0 would 400 at the
+  // route's min(1)); a required path param must appear with a literal.
+  const app = new OpenAPIHono()
+  app.openapi(
+    createRoute({
+      method: 'get',
+      path: '/thing/{id}',
+      tags: ['thing'],
+      operationId: 'get_thing',
+      request: { params: z.object({ id: z.string() }) },
+      responses: { 200: okResponse(z.object({ v: z.string() })) },
+    }),
+    (c) => c.json({ v: c.req.valid('param').id }, 200),
+  )
+  const h = new RouterGraphQLHandler(app)
+  const { sampleDocument } = await import('../src/mcp-tools.ts')
+  const sample = sampleDocument(h.schema, 'query')
+  assert.ok(sample, 'sample built')
+  assert.ok(sample!.includes('get_thing(id: "")'), sample!)
+  assert.ok(!sample!.includes('0:'), 'no index-keyed args')
+  // The example app's first query field has only optionals → bare sample.
+  const exampleAppSample = sampleDocument(handler.schema, 'query')
+  assert.ok(exampleAppSample!.includes('list_notes'), exampleAppSample!)
+  assert.ok(!exampleAppSample!.includes('limit'), 'optional args stay out (defaults run)')
+})
+
+test('graphql face: GraphiQL can be disabled or pointed at a self-hosted mirror', async () => {
+  const base = new OpenAPIHono()
+  base.openapi(
+    {
+      method: 'get',
+      path: '/ping',
+      tags: ['ping'],
+      operationId: 'ping',
+      responses: { 200: okResponse(z.object({ v: z.string() })) },
+    } as Parameters<typeof createRoute>[0],
+    (c) => c.json({ v: 'x' }, 200),
+  )
+
+  const off = new OpenAPIHono()
+  new HonoGqlMcp(base, { name: 'gql-off' }).mountGraphQL(off, { graphiql: false })
+  assert.equal((await off.request('/graphiql')).status, 404, 'route not registered')
+  assert.equal((await off.request('/graphql')).status, 405, 'the API face stays')
+
+  const mirrored = new OpenAPIHono()
+  new HonoGqlMcp(base, { name: 'gql-mirror' }).mountGraphQL(mirrored, { cdnBase: 'https://cdn.internal/' })
+  const html = await mirrored.request('/graphiql')
+  assert.equal(html.status, 200)
+  const body = await html.text()
+  assert.ok(body.includes('https://cdn.internal/react@'), 'importmap points at the mirror')
+  assert.ok(!body.includes('https://esm.sh/react@'), 'the default CDN is gone')
+})
+
 // -- runner ----------------------------------------------------------------------
 let failed = 0
 for (const [name, fn] of tests) {

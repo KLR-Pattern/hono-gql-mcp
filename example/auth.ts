@@ -63,6 +63,22 @@ export interface Auth {
 
 // ---- outbound fetch: optional egress proxy + CIMD SSRF guard ------------------
 
+/**
+ * Warn at most once per minute per site. A client spraying bad tokens at the
+ * gate must not grow the log unboundedly — the bridge's rateLimit caps the
+ * request flood, this caps the log lines (and keeps one visible sample of
+ * each failure mode for operators).
+ */
+const throttledWarn = (() => {
+  const last = new Map<string, number>()
+  return (site: string, err: unknown): void => {
+    const now = Date.now()
+    if (now - (last.get(site) ?? 0) < 60_000) return
+    last.set(site, now)
+    console.warn(`[auth] ${site}:`, err instanceof Error ? err.message : err)
+  }
+})()
+
 /** One ProxyAgent per process; reused so every proxied call shares the pool. */
 let proxyAgentPromise: Promise<ProxyAgent> | undefined
 function proxyAgentFor(url: string): Promise<ProxyAgent> {
@@ -217,7 +233,7 @@ export async function createAuth(cfg: AuthConfig): Promise<Auth> {
       try {
         claims = await verifyClaims(token)
       } catch (err) {
-        console.warn('[auth] gate rejected a bearer:', err instanceof Error ? err.message : err)
+        throttledWarn('gate rejected a bearer', err)
         return null
       }
       const scope = typeof claims.scope === 'string' ? claims.scope : ''
@@ -245,7 +261,7 @@ export async function createAuth(cfg: AuthConfig): Promise<Auth> {
           if (!id) return null
           return { id, name: String(claims.name ?? claims.preferred_username ?? id) }
         } catch (err) {
-          console.warn('[auth] route check rejected a bearer:', err instanceof Error ? err.message : err)
+          throttledWarn('route check rejected a bearer', err)
           return null
         }
       }

@@ -57,18 +57,6 @@ hides the write fields from graphql-js's own serializer. The spec serializes
 resolves concurrently. Resolvers reach the queue in document order, and a FIFO
 chain restores the guarantee. A failing write does not block its successors.
 
-### Architecture map to fastapi-gql-mcp
-
-| fastapi-gql-mcp (Python) | hono-gql-mcp (TS) |
-|---|---|
-| `app.routes` + Pydantic annotations | `openAPIRegistry.definitions` + Zod schemas |
-| Pydantic → GraphQL mapper (graphql-core) | `ZodGraphqlMapper` reading Zod v4 `.def` (graphql-js) |
-| `tags=["shop:catalog"]` → domain tree | `RouteConfig.tags` → same tree (`domains.ts`, multi-tag membership) |
-| docstrings → schema descriptions | `summary` / `description` / `.describe()` / `.meta()` |
-| in-process ASGI call | `app.request()` (same `#dispatch` as production) |
-| `passthrough_headers=["authorization"]` | same default, case-insensitive whitelist |
-| fastmcp | `@modelcontextprotocol/server` 2.x `createMcpHandler` + `McpServer` |
-
 ### zValidator-style routes
 
 Routes written with plain `@hono/zod-validator` cannot be derived — the
@@ -194,6 +182,16 @@ handler's passthrough whitelist with MCP — browser sessions ride `cookie`
 once it is whitelisted. Status parity with the Python face: 200 while `data`
 is present (partial failure keeps nulls + errors), 400 for whole-document
 failure. The POST must carry `Content-Type: application/json` (415 otherwise)
+
+The playground loads pinned GraphiQL/React modules from the esm.sh CDN. Two
+knobs for environments that cannot reach it: `graphiql: false` skips the
+route entirely, and `cdnBase: 'https://your-mirror'` repoints the importmap
+at a self-hosted esm.sh-compatible mirror:
+
+```ts
+bridge.mountGraphQL(app, { graphiql: false })                    // no CDN dependency
+bridge.mountGraphQL(app, { cdnBase: 'https://cdn.internal' })    // self-hosted mirror
+```
 — Hono's body parser accepts any content-type, and a `text/plain` HTML-form
 POST is a CORS "simple request" that skips preflight, so the check is what
 keeps a cross-site page from firing mutations with a whitelisted session
@@ -495,7 +493,7 @@ The verified run (2026-10-11) used Node 24.21.0 / npm 11.19.0.
 
 ## Verified (PoC, 2026-10-11)
 
-`npm test` — 18 unit + 72 end-to-end checks, all passing (plain `node`,
+`npm test` — 18 unit + 75 end-to-end checks, all passing (plain `node`,
 type-stripping mode); `npm run test:cov` reports c8 line/branch coverage
 over `src/`. The unit layer covers the pure pieces in isolation: fnmatch
 globs (incl. `[seq]` character classes), `documentDepth` (fragments, inline
@@ -510,13 +508,14 @@ skip rule. The e2e layer:
   check); array query args arrive as arrays, not a comma-joined string;
   a schema with an empty `type Query` reports instead of throwing at request
   time; a type-name rename is reported without marking the bridge unready;
-  fragments add no depth; and the `graphql_query` description's example is
-  derived from the live schema and asserted runnable
+  fragments add no depth; and the tools' description examples (query AND
+  mutation) are derived from the live schema and asserted runnable — required
+  args carried with minimal literals, optionals omitted so route defaults run
 - **later additions**: `graphql_mutation` refusing non-mutation documents;
   sub-app mounting (`app.route()` registry path merge) derived and executed;
   multipart-body skip; explicit `z.void()` Boolean success; non-JSON 2xx
   raw-text passthrough; `get_query_schema` on a mutation-only domain answering
-  `DOMAIN_NOT_FOUND`
+  `DOMAIN_NOT_FOUND`; GraphiQL disable/cdnBase options
 
 - composition across 3 domains (nested tag included); field selection;
   partial failure (a 404 route nulls only itself, siblings survive)
@@ -586,8 +585,6 @@ track **Node 24 LTS**, and the suite passes on both 24.21.0 and 22.22.0.
 
 ## Not in the PoC (the Python original has them)
 
-- sub-app mounting (`app.route()` + `basePath()`): registry path merging was
-  verified in isolation during research; not covered by this test suite
 - benchmark comparison against fastmcp-TS `fromOpenAPI` / ClawQL (the Python
   repo's comparison/ methodology ports directly)
 - ready-made IdP adapters inside the library (Python fastmcp ships
@@ -600,7 +597,7 @@ track **Node 24 LTS**, and the suite passes on both 24.21.0 and 22.22.0.
 
 ```bash
 npm install
-npm test          # 18 unit + 72 e2e checks (plain node — type stripping, no bundler)
+npm test          # 18 unit + 75 e2e checks (plain node — type stripping, no bundler)
 npm run test:cov  # the same under c8 — line/branch coverage for src/
 npm run example   # notes demo on :8020 — REST + Swagger + GitHub login + OAuth-gated /mcp + GraphiQL
 npm run example:oauth   # the fastapi-gql-mcp notes_oauth port (examples/notes_oauth), same :8020

@@ -32,6 +32,7 @@ import {
   OUTBOUND_PROXY,
   PORT,
   githubConfigured,
+  MCP_RATE_LIMIT,
   otelEnabled,
   secretIsDefault,
 } from './config.ts'
@@ -142,6 +143,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<App> {
     name: 'notes-api',
     allowMutation: true,
     passthroughHeaders: ['authorization', 'cookie'],
+    // Caps a token-spray against the gate (each rejection also warns once per
+    // minute in auth.ts — together they bound both the request flood and the
+    // log flood a bad client can cause).
+    rateLimit: { maxPerSecond: MCP_RATE_LIMIT },
     instructions:
       'Notes service exposed as GraphQL (reads and writes). Domains: notes, analytics, catalog. ' +
       'Call get_schema once, then compose routes in a single graphql_query — a failing route nulls ' +
@@ -186,6 +191,7 @@ if (isMain) {
       `  MCP      http://localhost:${info.port}/mcp  ${githubConfigured ? '(OAuth 2.1 gated)' : '(open — no GitHub creds)'}`,
     )
     console.log(`\nDerived GraphQL schema (${bridge.handler.domains.length} domains):\n`)
+    console.log(`  (The fastapi-gql-mcp notes_oauth port — hand-rolled auth for Python-parity\n   verification — lives in examples/notes_oauth, npm run example:oauth.)`)
     console.log(bridge.handler.getSDL())
   })
 

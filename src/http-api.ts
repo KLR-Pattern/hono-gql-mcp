@@ -14,6 +14,19 @@ import type { RouterGraphQLHandler } from './handler.ts'
 export interface GraphqlMountOptions {
   graphqlPath?: string
   graphiqlPath?: string
+  /**
+   * Serve the GraphiQL playground at `graphiqlPath` (default true). Pass false
+   * when you host your own UI or want no CDN dependency at all — the route is
+   * then not registered.
+   */
+  graphiql?: boolean
+  /**
+   * Base URL for the playground's CDN assets (default `https://esm.sh`). The
+   * page loads pinned GraphiQL/React modules from an esm.sh-compatible
+   * endpoint — point this at a self-hosted mirror for offline or
+   * air-gapped deployments.
+   */
+  cdnBase?: string
 }
 
 /**
@@ -52,9 +65,10 @@ const jsString = (s: string): string => JSON.stringify(s)
  * @graphiql/react, shared by every entry in the importmap — without them each
  * bundle inlines its own React and hooks fail across the boundary.
  */
-function graphiqlHtml(graphqlPath: string): string {
+function graphiqlHtml(graphqlPath: string, cdnBase: string): string {
   const v = GRAPHIQL_VERSIONS
   const url = jsString(graphqlPath)
+  const cdn = cdnBase.replace(/\/+$/, '')
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -67,22 +81,22 @@ function graphiqlHtml(graphqlPath: string): string {
     .loading { height: 100%; display: flex; align-items: center; justify-content: center;
                font-size: 2rem; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
   </style>
-  <link rel="stylesheet" href="https://esm.sh/graphiql@${v.graphiql}/dist/style.css" />
-  <link rel="stylesheet" href="https://esm.sh/@graphiql/plugin-explorer@${v.graphiqlExplorer}/dist/style.css" />
+  <link rel="stylesheet" href="${cdn}/graphiql@${v.graphiql}/dist/style.css" />
+  <link rel="stylesheet" href="${cdn}/@graphiql/plugin-explorer@${v.graphiqlExplorer}/dist/style.css" />
   <script type="importmap">
     {
       "imports": {
-        "react": "https://esm.sh/react@${v.react}",
-        "react/jsx-runtime": "https://esm.sh/react@${v.react}/jsx-runtime",
-        "react-dom": "https://esm.sh/react-dom@${v.react}",
-        "react-dom/client": "https://esm.sh/react-dom@${v.react}/client",
+        "react": "${cdn}/react@${v.react}",
+        "react/jsx-runtime": "${cdn}/react@${v.react}/jsx-runtime",
+        "react-dom": "${cdn}/react-dom@${v.react}",
+        "react-dom/client": "${cdn}/react-dom@${v.react}/client",
         "@emotion/is-prop-valid": "data:text/javascript,",
-        "graphiql": "https://esm.sh/graphiql@${v.graphiql}?standalone&external=react,react-dom,@graphiql/react,graphql",
-        "graphiql/": "https://esm.sh/graphiql@${v.graphiql}/",
-        "@graphiql/plugin-explorer": "https://esm.sh/@graphiql/plugin-explorer@${v.graphiqlExplorer}?standalone&external=react,@graphiql/react,graphql",
-        "@graphiql/react": "https://esm.sh/@graphiql/react@${v.graphiqlReact}?standalone&external=react,react-dom,graphql,@emotion/is-prop-valid",
-        "@graphiql/toolkit": "https://esm.sh/@graphiql/toolkit@${v.graphiqlToolkit}?standalone&external=graphql",
-        "graphql": "https://esm.sh/graphql@${v.graphql}"
+        "graphiql": "${cdn}/graphiql@${v.graphiql}?standalone&external=react,react-dom,@graphiql/react,graphql",
+        "graphiql/": "${cdn}/graphiql@${v.graphiql}/",
+        "@graphiql/plugin-explorer": "${cdn}/@graphiql/plugin-explorer@${v.graphiqlExplorer}?standalone&external=react,@graphiql/react,graphql",
+        "@graphiql/react": "${cdn}/@graphiql/react@${v.graphiqlReact}?standalone&external=react,react-dom,graphql,@emotion/is-prop-valid",
+        "@graphiql/toolkit": "${cdn}/@graphiql/toolkit@${v.graphiqlToolkit}?standalone&external=graphql",
+        "graphql": "${cdn}/graphql@${v.graphql}"
       }
     }
   </script>
@@ -191,5 +205,7 @@ export function mountGraphQL(
     ),
   )
 
-  app.get(graphiqlPath, (c) => c.html(graphiqlHtml(graphqlPath)))
+  if (opts.graphiql !== false) {
+    app.get(graphiqlPath, (c) => c.html(graphiqlHtml(graphqlPath, opts.cdnBase ?? 'https://esm.sh')))
+  }
 }

@@ -27,6 +27,9 @@ export const secretIsDefault = BETTER_AUTH_SECRET === DEV_SECRET
 /** RFC 8707 / 9728 resource identifier: the canonical URL of the MCP endpoint. */
 export const MCP_RESOURCE = `${BASE_URL}/mcp`
 
+/** MCP endpoint rate limit, per caller per second (tests raise it via e2e.env). */
+export const MCP_RATE_LIMIT = Number(process.env.MCP_RATE_LIMIT ?? 20)
+
 /** GitHub login + MCP OAuth are wired only when BOTH creds are present. */
 export const githubConfigured = Boolean(GITHUB_CLIENT_ID && GITHUB_CLIENT_SECRET)
 
