@@ -1,29 +1,37 @@
 /**
- * bridgeValidator — a zValidator that survives bridge introspection.
+ * zValidator (shadow re-export) — same name, same behavior, plus bridge
+ * introspection.
  *
- * Plain `@hono/zod-validator` routes cannot be derived: the schema is captured
- * in the validator's closure and nothing on the returned middleware exposes
- * it at runtime — `app.routes` gives you the handler reference and nothing
- * else. This wrapper attaches the schema (plus optional metadata) to the
- * middleware under a well-known Symbol, the same pattern rhinobase's
- * hono-openapi uses for its spec generation. The scanner reads it as a second
- * introspection source, next to the zod-openapi registry.
+ * Routes written with plain `@hono/zod-validator` cannot be derived: the
+ * schema is captured in the validator's closure and nothing on the returned
+ * middleware exposes it at runtime (and ESM module namespaces are frozen, so
+ * patching the original export is impossible — shadowing the import is the
+ * maximum-reach, zero-call-site-change form). Point the import at this
+ * package and every existing `zValidator(...)` call site keeps working,
+ * unchanged, while becoming visible to the bridge:
  *
  * ```ts
- * import { bridgeValidator } from 'hono-gql-mcp'
+ * import { zValidator } from 'hono-gql-mcp'        // the ONLY change
  *
- * app.get(
- *   '/notes/search',
- *   bridgeValidator('query', SearchQuery, { tags: ['notes'], summary: 'Search notes.' }),
- *   (c) => c.json([...]),            // responseSchema omitted → raw-JSON bucket
- * )
+ * app.get('/search', zValidator('query', SearchQuery), handler)   // derived
+ * // bridge metadata rides the 3rd argument (or the 4th, beside a hook):
+ * app.get('/notes', zValidator('query', ListQuery, {
+ *   tags: ['notes'], summary: 'Browse.', responseSchema: z.array(Note),
+ * }), handler)
+ * app.post('/notes', zValidator('json', NewNote, myHook, { tags: ['notes'] }), handler)
  * ```
  *
- * Trade-off vs zod-openapi routes: one import line replaces zero-touch —
- * that is the minimum possible, the schema itself cannot be recovered from a
- * plain zValidator closure.
+ * The 3rd argument is discriminated by shape: a FUNCTION is the original
+ * zValidator hook (validation behavior unchanged); a plain OBJECT is bridge
+ * metadata. `bridgeValidator` (the original wrapper's name) remains as a
+ * deprecated alias.
  */
-import { zValidator } from '@hono/zod-validator'
+import { zValidator as zodValidator, type Hook } from '@hono/zod-validator'
+import type { Env, Input, MiddlewareHandler, TypedResponse, ValidationTargets } from 'hono'
+import type { InferInput } from 'hono/validator'
+import type * as v3 from 'zod/v3'
+import type { ZodSafeParseResult } from 'zod/v4'
+import type * as v4 from 'zod/v4/core'
 import type { ZodType } from 'zod'
 
 /** Well-known Symbol the scanner looks for on route handlers. */
@@ -49,12 +57,107 @@ export interface ValidatorAttachment {
   options: BridgeValidatorOptions
 }
 
-/** zValidator behavior unchanged (same validation, same 400s) — plus the introspection side-channel. */
-export function bridgeValidator<T extends ValidatorTarget, S extends ZodType>(
-  target: T,
-  schema: S,
-  options: BridgeValidatorOptions = {},
-) {
-  const mw = zValidator(target, schema)
-  return Object.assign(mw, { [VALIDATOR_SCHEMA]: { target, schema, options } satisfies ValidatorAttachment })
+// ---- hono/zod-validator type machinery, replicated to keep inference -------
+// Not all of it is re-exported by @hono/zod-validator, so the aliases are
+// copied verbatim from its .d.mts — this is what lets `c.req.valid()` typing
+// flow through the shadow exactly as through the original.
+
+type ZodSchema = v3.ZodType | v4.$ZodType
+type ZodValidatorFailureBody<T extends ZodSchema> = T extends v4.$ZodType
+  ? Extract<ZodSafeParseResult<v4.output<T>>, { success: false }>
+  : T extends v3.ZodType
+    ? Extract<v3.SafeParseReturnType<v3.input<T>, v3.output<T>>, { success: false }>
+    : never
+type ZodValidatorFailureResponse<T extends ZodSchema> = Response & TypedResponse<ZodValidatorFailureBody<T>, 400, 'json'>
+type zInput<T> = T extends v3.ZodType ? v3.input<T> : T extends v4.$ZodType ? v4.input<T> : never
+type zOutput<T> = T extends v3.ZodType ? v3.output<T> : T extends v4.$ZodType ? v4.output<T> : never
+type zInfer<T> = T extends v3.ZodType ? v3.infer<T> : T extends v4.$ZodType ? v4.infer<T> : never
+type ExtractValidationResponse<VF> = VF extends (value: never, c: never) => infer R
+  ? R extends Promise<infer PR>
+    ? PR extends TypedResponse<infer T, infer S, infer F>
+      ? Response & TypedResponse<T, S, F>
+      : PR extends Response
+        ? PR
+        : PR extends undefined
+          ? never
+          : never
+    : R extends TypedResponse<infer T, infer S, infer F>
+      ? Response & TypedResponse<T, S, F>
+      : R extends Response
+        ? R
+        : R extends undefined
+          ? never
+          : never
+  : never
+type HasUndefined<T> = undefined extends T ? true : false
+type DefaultInput<Target extends keyof ValidationTargets, In, Out> = {
+  in: HasUndefined<In> extends true
+    ? { [K in Target]?: [In] extends [ValidationTargets[K]] ? In : InferInput<In, K> }
+    : { [K in Target]: [In] extends [ValidationTargets[K]] ? In : InferInput<In, K> }
+  out: { [K in Target]: Out }
 }
+
+// ---- the wrapper: hono's overloads + the metadata object form ---------------
+
+export function zValidator<T extends ZodSchema, Target extends keyof ValidationTargets, E extends Env, P extends string, In = zInput<T>, Out = zOutput<T>, I extends Input = DefaultInput<Target, In, Out>, V extends I = I>(
+  target: Target,
+  schema: T,
+  hook?: undefined,
+  meta?: BridgeValidatorOptions,
+): MiddlewareHandler<E, P, V, ZodValidatorFailureResponse<T>>
+export function zValidator<T extends ZodSchema, Target extends keyof ValidationTargets, E extends Env, P extends string, HookFn extends Hook<InferredValue, E, P, Target, {}, T>, In = zInput<T>, Out = zOutput<T>, I extends Input = DefaultInput<Target, In, Out>, V extends I = I, InferredValue = zInfer<T>>(
+  target: Target,
+  schema: T,
+  hook: HookFn,
+  meta?: BridgeValidatorOptions,
+): MiddlewareHandler<E, P, V, ExtractValidationResponse<HookFn>>
+export function zValidator<T extends ZodSchema, Target extends keyof ValidationTargets, E extends Env, P extends string, In = zInput<T>, Out = zOutput<T>, I extends Input = DefaultInput<Target, In, Out>, V extends I = I>(
+  target: Target,
+  schema: T,
+  meta: BridgeValidatorOptions,
+): MiddlewareHandler<E, P, V, ZodValidatorFailureResponse<T>>
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- loose impl signature; the overloads above carry the types
+export function zValidator(target: any, schema: any, hookOrMeta?: any, metaArg?: any): any {
+  const [hook, options] =
+    typeof hookOrMeta === 'function'
+      ? [hookOrMeta as Hook<never, never, never>, metaArg ?? {}]
+      : [undefined, (hookOrMeta as BridgeValidatorOptions | undefined) ?? {}]
+  const mw = zodValidator(
+    target as never,
+    schema as never,
+    hook as never,
+    // No validationFunction pass-through: rare, and the original import stays
+    // available for those callers. Everything else behaves identically.
+    undefined,
+  )
+  return Object.assign(mw, {
+    [VALIDATOR_SCHEMA]: { target, schema: schema as ZodType, options } satisfies ValidatorAttachment,
+  })
+}
+
+/**
+ * @deprecated Import { zValidator } from 'hono-gql-mcp' instead — the shadow
+ * export keeps every existing call site unchanged, including the name.
+ * (Own generic signature: T must stay the caller's concrete schema so
+ * `c.req.valid()` typing flows, not the broad ZodType.)
+ */
+export function bridgeValidator<
+  T extends ZodSchema,
+  Target extends keyof ValidationTargets,
+  E extends Env,
+  P extends string,
+  In = zInput<T>,
+  Out = zOutput<T>,
+  I extends Input = DefaultInput<Target, In, Out>,
+  V extends I = I,
+>(
+  target: Target,
+  schema: T,
+  options: BridgeValidatorOptions = {},
+): MiddlewareHandler<E, P, V, ZodValidatorFailureResponse<T>> {
+  return zValidator(target, schema, options) as never
+}
+
+// Re-export hono's hook type under the name callers of the ORIGINAL package
+// used, so switching the import line breaks nothing type-wise.
+export type { Hook }

@@ -58,36 +58,45 @@ hides the write fields from graphql-js's own serializer. The spec serializes
 resolves concurrently. Resolvers reach the queue in document order, and a FIFO
 chain restores the guarantee. A failing write does not block its successors.
 
-### zValidator-style routes
+### zValidator routes: change the import, nothing else
 
 Routes written with plain `@hono/zod-validator` cannot be derived — the
-schema lives in the validator's closure and nothing exposes it at runtime.
-`bridgeValidator` is a drop-in wrapper (zValidator behavior unchanged) that
-attaches the schema to the middleware under a well-known Symbol, which the
-scanner reads as a second introspection source — one import line is the
-whole migration:
+schema lives in the validator's closure and nothing exposes it at runtime
+(and ESM module namespaces are frozen, so patching the original export is
+out of the question). This package therefore exports its own `zValidator`:
+**behaviorally identical** (it wraps the original), plus the schema
+attachment the scanner reads. Point the import here and every existing call
+site keeps working, unchanged, while becoming visible to the bridge:
 
 ```ts
-import { bridgeValidator } from 'hono-gql-mcp'
+import { zValidator } from 'hono-gql-mcp'   // the only change
 
-app.get(
-  '/search',
-  bridgeValidator('query', SearchQuery, {
-    tags: ['notes'],                      // domain grouping
-    summary: 'Search notes by title.',
-    responseSchema: z.array(Note),        // without it → the raw-JSON bucket
-  }),
-  (c) => c.json(hits),                    // c.req.valid() types flow as with zValidator
-)
+app.get('/search', zValidator('query', SearchQuery), handler)  // derived, with defaults
 ```
 
-Semantics vs zod-openapi routes: `param`/`query`/`json` targets map to
-params/query/body arguments; `form` targets and wildcard paths are dropped
-(silently — no RouteConfig exists to classify into skip buckets); tags and
-path filters apply the same way; the field name derives as
-`<method>_<path>` when no operationId concept applies. zod-openapi routes
+The 3rd argument is discriminated by shape — a **function** is the original
+zValidator hook (validation behavior unchanged), a plain **object** is
+bridge metadata; both can be combined:
+
+```ts
+app.get('/notes', zValidator('query', ListQuery, {
+  tags: ['notes'],                      // domain grouping
+  summary: 'Browse notes.',
+  responseSchema: z.array(Note),        // without it → the raw-JSON bucket
+}), handler)
+
+app.post('/notes', zValidator('json', NewNote, myHook, { tags: ['notes'] }), handler)
+```
+
+Without metadata the route still derives: untagged routes group by their
+first path segment, and a missing `responseSchema` lands in the raw-JSON
+bucket (callable, not field-selectable). Semantics vs zod-openapi routes:
+`param`/`query`/`json` targets map to params/query/body arguments; `form`
+targets and wildcard paths are dropped; tags and path filters apply the
+same way; the field name derives as `<method>_<path>`. zod-openapi routes
 (registered via `app.openapi`) never duplicate — their handlers carry no
-Symbol.
+attachment. `bridgeValidator` (the previous name for the wrapper) remains
+exported as a deprecated alias.
 
 ### The Zod mapper
 

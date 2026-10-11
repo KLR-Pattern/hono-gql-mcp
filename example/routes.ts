@@ -11,7 +11,7 @@
  */
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
 import type { Context } from 'hono'
-import { bridgeValidator } from '../src/index.ts'
+import { zValidator } from '../src/index.ts'
 import type { Caller } from './auth.ts'
 import type { CategoryShape, Store } from './store.ts'
 
@@ -169,7 +169,7 @@ export function registerRoutes(app: OpenAPIHono<Env>, store: Store): void {
   // closure-private and cannot be derived).
   app.get(
     '/search',
-    bridgeValidator(
+    zValidator(
       'query',
       z.object({
         q: z.string().min(1).describe('Search text.'),

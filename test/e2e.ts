@@ -21,7 +21,7 @@ for (const suffix of ['', '-wal', '-shm']) rmSync(`${DB_PATH}${suffix}`, { force
 
 const { createApp } = await import('../example/app.ts')
 import { parse, validate } from 'graphql'
-import { bridgeValidator, documentDepth, HonoGqlMcp, LruCache, RouterGraphQLHandler } from '../src/index.ts'
+import { bridgeValidator, documentDepth, HonoGqlMcp, LruCache, RouterGraphQLHandler, zValidator } from '../src/index.ts'
 
 const tests: Array<[name: string, fn: () => void | Promise<void>]> = []
 const test = (name: string, fn: () => void | Promise<void>) => tests.push([name, fn])
@@ -1727,6 +1727,52 @@ test('graphql face: GraphiQL can be disabled or pointed at a self-hosted mirror'
   const body = await html.text()
   assert.ok(body.includes('https://cdn.internal/react@'), 'importmap points at the mirror')
   assert.ok(!body.includes('https://esm.sh/react@'), 'the default CDN is gone')
+})
+
+
+test('zValidator shadow: change the import only — bare, metadata, and hook+meta forms', async () => {
+  const app = new OpenAPIHono()
+  // form 1 — bare: the exact original call shape, derived with defaults.
+  app.get('/bare', zValidator('query', z.object({})), (c) => c.json({ ok: true }))
+  // form 2 — bridge metadata as the 3rd argument.
+  app.get(
+    '/meta',
+    zValidator('query', z.object({ n: z.string() }), {
+      tags: ['shadow'],
+      summary: 'With metadata.',
+      responseSchema: z.object({ got: z.string() }),
+    }),
+    (c) => c.json({ got: c.req.valid('query').n }, 200),
+  )
+  // form 3 — the original hook as 3rd + metadata as 4th; the hook must still run.
+  let hookRan = false
+  app.get(
+    '/hooked',
+    zValidator(
+      'query',
+      z.object({ n: z.string() }),
+      (result) => {
+        if (result.success) hookRan = true
+      },
+      { tags: ['shadow'], responseSchema: z.object({ got: z.string() }) },
+    ),
+    (c) => c.json({ got: c.req.valid('query').n }, 200),
+  )
+  const h = new RouterGraphQLHandler(app)
+  assert.ok(h.getSDL().includes('get_bare'), 'bare form derived (defaults)')
+  assert.ok(h.getSDL().includes('got: String'), 'metadata form is field-selectable')
+
+  const meta = await h.execute(`{ shadow { get_meta(n: "x") { got } } }`)
+  assert.equal(d(meta).shadow.get_meta.got, 'x')
+  const hooked = await h.execute(`{ shadow { get_hooked(n: "y") { got } } }`)
+  assert.equal(d(hooked).shadow.get_hooked.got, 'y')
+  assert.ok(hookRan, 'the original hook still runs through the shadow')
+
+  // Validation behavior is the original's: a bad query answers zod's 400.
+  const bad = await h.execute(`{ shadow { get_hooked(n: "y") { got } } }`, undefined, {})
+  void bad
+  const badHttp = await app.request('/hooked?nope=1')
+  assert.equal(badHttp.status, 400, 'missing required query key → zod 400, unchanged')
 })
 
 // -- runner ----------------------------------------------------------------------

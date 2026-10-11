@@ -9,7 +9,7 @@
 import { serve } from '@hono/node-server'
 import { pathToFileURL } from 'node:url'
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
-import { bridgeValidator, HonoGqlMcp } from '../../src/index.ts'
+import { zValidator, HonoGqlMcp } from '../../src/index.ts'
 
 // ---- shared schemas -----------------------------------------------------------
 
@@ -353,7 +353,7 @@ export function createSinkApp() {
   // The zValidator-style second source, beside everything above.
   app.get(
     '/misc/search',
-    bridgeValidator('query', z.object({ q: z.string().min(1).describe('Search text.') }), {
+    zValidator('query', z.object({ q: z.string().min(1).describe('Search text.') }), {
       tags: ['misc'], summary: 'Search — zValidator-style route.', responseSchema: z.array(z.object({ hit: z.string() })),
     }),
     (c) => c.json([{ hit: c.req.valid('query').q }], 200),
