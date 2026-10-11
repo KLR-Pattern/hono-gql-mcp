@@ -1,7 +1,7 @@
 /**
  * In-app SQLite store — notes survive restarts.
  *
- * One database file (`example/data.sqlite`, or SQLITE_PATH) serves two tenants:
+ * One database file (`examples/notes/data.sqlite`, or SQLITE_PATH) serves two tenants:
  * better-auth's tables (users/sessions/JWKS/OAuth — created by its own
  * migration runner in auth.ts) and the demo's `notes` table (created here).
  * WAL mode keeps reads and the occasional write from blocking each other.

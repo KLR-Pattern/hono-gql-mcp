@@ -11,7 +11,7 @@
  */
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
 import type { Context } from 'hono'
-import { zValidator } from '../src/index.ts'
+import { zValidator } from '../../src/index.ts'
 import type { Caller } from './auth.ts'
 import type { CategoryShape, Store } from './store.ts'
 

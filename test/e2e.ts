@@ -12,14 +12,14 @@ import { rmSync } from 'node:fs'
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client'
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi'
 import type { Hono } from 'hono'
-import { DB_PATH, DEMO_OWNER } from '../example/store.ts'
+import { DB_PATH, DEMO_OWNER } from '../examples/notes/store.ts'
 
 // Verify isolation BEFORE loading the app: SQLITE_PATH points at test/.tmp/…
 // (test/e2e.env), and the file is cleared so counts are exact per run.
 // A body of accumulated state used to push a fresh row out of a 10-item window.
 for (const suffix of ['', '-wal', '-shm']) rmSync(`${DB_PATH}${suffix}`, { force: true })
 
-const { createApp } = await import('../example/app.ts')
+const { createApp } = await import('../examples/notes/app.ts')
 import { parse, validate } from 'graphql'
 import { documentDepth, HonoGqlMcp, LruCache, RouterGraphQLHandler, zValidator } from '../src/index.ts'
 

@@ -1,7 +1,7 @@
 /**
- * Example configuration — the ONE module in example/ that reads process.env.
+ * Example configuration — the ONE module in examples/notes/ that reads process.env.
  *
- * Loaded by the npm script via `node --env-file-if-exists=example/.env`
+ * Loaded by the npm script via `node --env-file-if-exists=examples/notes/.env`
  * (Node >= 20.12). With GitHub creds empty the app still runs: REST/GraphQL
  * stay open and /mcp is ungated — the mirror of fastapi-gql-mcp's
  * examples/notes_oauth behavior when its .env is blank.
@@ -42,7 +42,7 @@ export const githubConfigured = Boolean(GITHUB_CLIENT_ID && GITHUB_CLIENT_SECRET
 export const OUTBOUND_PROXY = process.env.OUTBOUND_PROXY ?? ''
 
 /**
- * Override the SQLite file location. Empty = `example/data.sqlite` beside the
+ * Override the SQLite file location. Empty = `examples/notes/data.sqlite` beside the
  * code (store.ts resolves the default relative to the module, not the cwd).
  */
 export const SQLITE_PATH = process.env.SQLITE_PATH ?? ''

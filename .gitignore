@@ -5,6 +5,6 @@ coverage/
 .env
 .env.*
 !.env.example
-example/data.sqlite*
+examples/notes/data.sqlite*
 test/.tmp/
 .DS_Store

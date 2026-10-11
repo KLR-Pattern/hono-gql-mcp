@@ -21,7 +21,7 @@ import { OpenAPIHono } from '@hono/zod-openapi'
 import { swaggerUI } from '@hono/swagger-ui'
 import type { Context, Next } from 'hono'
 import { httpInstrumentationMiddleware } from '@hono/otel'
-import { HonoGqlMcp } from '../src/index.ts'
+import { HonoGqlMcp } from '../../src/index.ts'
 import { createAuth, type Auth } from './auth.ts'
 import {
   BASE_URL,

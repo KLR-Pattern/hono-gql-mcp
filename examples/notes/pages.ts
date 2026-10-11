@@ -39,7 +39,7 @@ export function loginPageHtml(configured: boolean): string {
     return SHELL(
       'Login',
       `<h1>GitHub not configured</h1>
-       <p>Set <code>GITHUB_CLIENT_ID</code> and <code>GITHUB_CLIENT_SECRET</code> in <code>example/.env</code>, then restart.</p>
+       <p>Set <code>GITHUB_CLIENT_ID</code> and <code>GITHUB_CLIENT_SECRET</code> in <code>examples/notes/.env</code>, then restart.</p>
        <p class="muted">The REST and GraphQL surfaces still work; only login and the MCP OAuth gate need GitHub creds.</p>`,
     )
   }

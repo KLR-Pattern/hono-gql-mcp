@@ -559,7 +559,7 @@ track **Node 24 LTS**, and the suite passes on both 24.21.0 and 22.22.0.
 npm install
 npm test          # 21 unit + 76 e2e checks (plain node — type stripping, no bundler)
 npm run test:cov  # the same under c8 — 98% line / 87% branch over src/
-npm run example   # notes demo on :8020 — REST + Swagger + GitHub login + OAuth-gated /mcp + GraphiQL
+npm run example        # notes demo (examples/notes) — REST + Swagger + GitHub login + OAuth-gated /mcp + GraphiQL
 npm run example:oauth   # notes_oauth demo (examples/notes_oauth), same :8020
 npm run smoke:sink     # kitchen-sink battery: every derived field executed, REST/GraphQL parity
 HONO_GQL_MCP_OTEL=1 npm run example   # + route spans under graphql.execute
@@ -570,12 +570,12 @@ npm run build     # emit dist/ for publishing
 `npm test` needs non-empty `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET`, because
 the example wires GitHub login and the `/mcp` gate only when both are set — and
 one check asserts that gate's 401 challenge. Placeholders are enough; the suite
-never calls GitHub. With `example/.env` present locally this is already the case.
+never calls GitHub. With `examples/notes/.env` present locally this is already the case.
 CI passes them as job-level env.
 
 `npm test` runs against a throwaway database (`test/.tmp/e2e.sqlite`, set by
 `test/e2e.env` and deleted at the start of each run), so it never touches the
-demo's `example/data.sqlite` and counts are exact on every run. To point the
+demo's `examples/notes/data.sqlite` and counts are exact on every run. To point the
 example at another file, set `SQLITE_PATH`.
 
 The runner is plain `node` (Node ≥ 22.18 strips types natively), not tsx —
@@ -588,9 +588,9 @@ code avoids parameter properties), while consumers of the published package get
 the emitted `dist/`. `npm run typecheck` follows the sources; `npm run build`
 is the only thing that reads `tsconfig.build.json`.
 
-### The example app
+### The notes example (examples/notes)
 
-`example/` is a notes service a browser user and an agent both reach. It shows
+`examples/notes/` is a notes service a browser user and an agent both reach. It shows
 the two integrations the library leaves to the host:
 
 | Surface | Auth | How |
@@ -618,14 +618,14 @@ Setup:
 1. GitHub → Developer settings → OAuth Apps → New. Homepage
    `http://localhost:8020`; **Authorization callback URL**
    `http://localhost:8020/api/auth/callback/github`.
-2. `cp example/.env.example example/.env`, fill `GITHUB_CLIENT_ID` /
+2. `cp examples/notes/.env.example examples/notes/.env`, fill `GITHUB_CLIENT_ID` /
    `GITHUB_CLIENT_SECRET`, set `BETTER_AUTH_SECRET` (`openssl rand -hex 32`).
 3. `npm run example`. With creds empty the app still runs: REST/GraphQL stay
    open and `/mcp` is ungated.
 
 Notes are **per-user**: a note carries an owner, and someone else's note is a
 404 — it does not exist for you. Persistence is a single SQLite file
-(`example/data.sqlite`, gitignored): better-auth's tables (users, sessions,
+(`examples/notes/data.sqlite`, gitignored): better-auth's tables (users, sessions,
 JWKS, OAuth clients/tokens) and the demo's `notes` share it, so notes AND the
 MCP login survive restarts. Delete the file for a factory reset.
 
@@ -638,7 +638,7 @@ same JWT passes the gate and reaches the routes.
 
 ### The notes_oauth port (examples/notes_oauth)
 
-`examples/notes_oauth/` is the hand-rolled twin of `example/`: the same
+`examples/notes_oauth/` is the hand-rolled twin of `examples/notes/`: the same
 notes service, but the auth flow (GitHub login, session tokens, the MCP
 gate) is written out step by step instead of taken from better-auth — the
 shape to copy when porting the demo to another stack, and the place to read
