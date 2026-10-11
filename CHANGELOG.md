@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.2.1 (2026-10-11)
+
+**Fixed** — both found by the new kitchen-sink battery; both crashed
+construction with a raw graphql-js error, so the wrapped app failed to boot:
+
+- A wire argument name that is not a legal GraphQL identifier (e.g. a
+  hyphenated path param `/orders/{order-id}`). Arg names are now sanitized
+  for the schema (`order_id`) and translated back to the wire name at
+  execution — the route stays callable. Two params sanitizing onto the same
+  name skip the route with an explicit reason.
+- Object schemas whose KEYS are not legal identifiers (e.g.
+  `{'content-type': …}`) now degrade to the JSON scalar with a recorded
+  reason (input values cannot be translated back before the route's own
+  validation, so degrading is the honest bucket).
+
+**Added**
+
+- `examples/kitchen-sink` + `npm run smoke:sink` — a 22-route coverage
+  battery (CRUD shapes, nested/multi tags, recursion, unions, nativeEnum,
+  edge buckets, sub-app mounting) with an anomaly report: startup audit, an
+  executable document per derived field, REST-vs-GraphQL parity, and the
+  suspicious edges. Example-only; no library surface change.
+
 ## 0.2.0 (2026-10-11)
 
 **Added**
