@@ -10,8 +10,8 @@ with full composition and per-caller credentials, instead of one tool per
 route. The GraphQL layer and MCP server are derived from your existing
 `@hono/zod-openapi` app: zero decorators, zero schema changes.
 
-> **Status:** `0.2.1` on npm — early but tested: 21 unit + 75 e2e checks,
-> CI on every push, provenance-signed publishes. See
+> **Status:** on npm — early but tested: 21 unit + 75 e2e checks, CI on
+> every push, provenance-signed publishes. See
 > [Package status](#package-status) for the build details.
 
 ```ts
